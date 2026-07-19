@@ -142,6 +142,27 @@ _log = logging.getLogger(__name__)
 # when the same module is used across TestClient instances or uvicorn reloads.
 # ---------------------------------------------------------------------------
 
+def _no_live_gateway() -> bool:
+    """Dispatch gate for the desktop cron ticker (#66629).
+
+    Returns False while a live gateway owns this HERMES_HOME. The gateway's
+    ticker delivers through live platform adapters (interactive cards, rich
+    messages); the desktop ticker's standalone path silently degrades those to
+    plain text — so while a gateway is up, the desktop ticker must defer every
+    tick to it instead of racing it for ``cron/.tick.lock``. Evaluated per
+    tick, so the desktop ticker resumes automatically when the gateway stops.
+
+    Fails open (True): cron must never be left without a trigger because a
+    liveness probe errored.
+    """
+    try:
+        from gateway.status import get_running_pid_cached
+
+        return get_running_pid_cached() is None
+    except Exception:
+        return True
+
+
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
     """Tick the cron scheduler from inside the desktop dashboard backend.
 
@@ -153,14 +174,27 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
 
     Cross-process safe: the built-in provider's ``cron.scheduler.tick`` takes
     the ``cron/.tick.lock`` file lock, so this never double-fires alongside a
-    real gateway on the same HERMES_HOME — whichever process grabs the lock
-    first wins the tick.
+    real gateway on the same HERMES_HOME. Beyond that, ticks are gated on
+    ``_no_live_gateway`` where the provider supports it: winning the lock race
+    against a running gateway would route delivery through this backend's
+    degraded no-live-adapters path (#66629), so the desktop ticker only ticks
+    while no gateway owns this HERMES_HOME.
     """
+    import inspect
+
     from cron.scheduler_provider import resolve_cron_scheduler
 
     provider = resolve_cron_scheduler()
+    kwargs = {}
+    # ``can_dispatch`` is a built-in-provider extension, not part of the
+    # CronScheduler ABC — only pass it where the signature accepts it.
+    try:
+        if "can_dispatch" in inspect.signature(provider.start).parameters:
+            kwargs["can_dispatch"] = _no_live_gateway
+    except (TypeError, ValueError):
+        pass
     _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
-    provider.start(stop_event, interval=interval)
+    provider.start(stop_event, interval=interval, **kwargs)
 
 
 def _warm_gateway_module() -> None:

@@ -691,3 +691,107 @@ class TestGuardJobCredentialExfil:
 
         monkeypatch.setattr(ct, "_validate_cron_base_url", _boom)
         assert _guard_job_credential_exfil({"id": "j8", "provider": "anthropic"}) is None
+
+
+# ── #66629: desktop ticker defers to a live gateway ──────────────────────────
+# The desktop dashboard's cron ticker delivers through a standalone path with
+# no live platform adapters (interactive cards degrade to plain text). The
+# cron/.tick.lock only arbitrates double-firing, not delivery quality — so the
+# desktop ticker gates each tick on "no live gateway owns this HERMES_HOME"
+# and resumes automatically when the gateway stops.
+
+
+def test_no_live_gateway_gate(monkeypatch):
+    """_no_live_gateway: False while a gateway PID is live, True when none,
+    True (fail open — cron must never lose its trigger) on probe errors."""
+    import gateway.status as status
+    from hermes_cli.web_server import _no_live_gateway
+
+    monkeypatch.setattr(status, "get_running_pid_cached", lambda *a, **k: 4321)
+    assert _no_live_gateway() is False
+
+    monkeypatch.setattr(status, "get_running_pid_cached", lambda *a, **k: None)
+    assert _no_live_gateway() is True
+
+    def _boom(*a, **k):
+        raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(status, "get_running_pid_cached", _boom)
+    assert _no_live_gateway() is True
+
+
+def test_desktop_ticker_defers_while_gateway_running(monkeypatch):
+    """With a live gateway on the same HERMES_HOME the desktop ticker skips
+    every tick; when the gateway stops, ticking resumes on its own."""
+    import gateway.status as status
+    from hermes_cli.web_server import _start_desktop_cron_ticker
+
+    gateway_pid = {"pid": 4321}
+    monkeypatch.setattr(
+        status, "get_running_pid_cached", lambda *a, **k: gateway_pid["pid"]
+    )
+
+    calls = []
+    stop = threading.Event()
+
+    with patch("cron.scheduler.tick", side_effect=lambda *a, **k: calls.append(k) or 0):
+        t = threading.Thread(
+            target=_start_desktop_cron_ticker,
+            args=(stop,),
+            kwargs={"interval": 0.01},
+            daemon=True,
+        )
+        t.start()
+        time.sleep(0.05)
+        assert calls == [], "desktop ticker ticked while a gateway was running"
+        gateway_pid["pid"] = None  # gateway stopped
+        assert _wait_until(lambda: len(calls) >= 1), \
+            "desktop ticker did not resume after the gateway stopped"
+        stop.set()
+        t.join(timeout=5)
+
+    assert not t.is_alive(), "desktop ticker did not exit after stop_event was set"
+
+
+def test_desktop_ticker_wires_gate_into_builtin_provider(monkeypatch):
+    """The built-in provider (whose start() accepts can_dispatch) receives the
+    gateway-liveness gate."""
+    import cron.scheduler_provider as sp
+    import hermes_cli.web_server as ws
+
+    captured = {}
+
+    class FakeWithGate(sp.CronScheduler):
+        @property
+        def name(self):
+            return "fake-with-gate"
+
+        def start(self, stop_event, *, adapters=None, loop=None, interval=60, can_dispatch=None):
+            captured["can_dispatch"] = can_dispatch
+
+    monkeypatch.setattr(sp, "resolve_cron_scheduler", lambda: FakeWithGate())
+    ws._start_desktop_cron_ticker(threading.Event(), interval=0)
+
+    assert captured["can_dispatch"] is ws._no_live_gateway
+
+
+def test_desktop_ticker_omits_gate_for_provider_without_can_dispatch(monkeypatch):
+    """A provider whose start() does not accept can_dispatch (the ABC minimum)
+    is called without the kwarg — no TypeError, no gate."""
+    import cron.scheduler_provider as sp
+    import hermes_cli.web_server as ws
+
+    captured = {}
+
+    class FakeMinimal(sp.CronScheduler):
+        @property
+        def name(self):
+            return "fake-minimal"
+
+        def start(self, stop_event, *, adapters=None, loop=None, interval=60):
+            captured["kwargs_seen"] = True
+
+    monkeypatch.setattr(sp, "resolve_cron_scheduler", lambda: FakeMinimal())
+    ws._start_desktop_cron_ticker(threading.Event(), interval=0)  # must not raise
+
+    assert captured.get("kwargs_seen") is True
