@@ -10,11 +10,22 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from PIL import Image
+
+
+def _real_png_bytes(size=(4, 4)) -> bytes:
+    """A real, fully-decodable PNG. _build_structured_messages now
+    decode-validates image bytes via tools.image_source.verify_decodable_image
+    before embedding them (issue #69078)."""
+    buf = io.BytesIO()
+    Image.new("RGB", size, color=(1, 2, 3)).save(buf, format="PNG")
+    return buf.getvalue()
 
 from agent.plugin_llm import (
     PluginLlm,
@@ -308,7 +319,7 @@ class TestStructuredMessageBuilding:
         assert "Schema name: action.items" in header
 
     def test_image_bytes_encoded_as_data_url(self):
-        png_bytes = b"\x89PNG\r\n\x1a\nfake"
+        png_bytes = _real_png_bytes()
         messages = _build_structured_messages(
             instructions="Read the image",
             inputs=[
@@ -327,6 +338,22 @@ class TestStructuredMessageBuilding:
         decoded = base64.b64decode(url.split(",", 1)[1])
         assert decoded == png_bytes
         assert parts[2] == {"type": "text", "text": "prefer printed text"}
+
+    def test_corrupt_image_bytes_rejected(self):
+        """Issue #69078: a plugin can hand us arbitrary bytes it read from
+        disk/network. A truncated/corrupt image must be rejected before it's
+        silently base64-embedded into the request, not sail through because
+        it merely has a valid PNG magic signature."""
+        fake_png = b"\x89PNG\r\n\x1a\nfake"
+        with pytest.raises(ValueError, match="decode validation"):
+            _build_structured_messages(
+                instructions="Read the image",
+                inputs=[PluginLlmImageInput(data=fake_png, mime_type="image/png")],
+                json_mode=False,
+                json_schema=None,
+                schema_name=None,
+                system_prompt=None,
+            )
 
     def test_image_url_passed_through(self):
         messages = _build_structured_messages(
@@ -656,7 +683,7 @@ class TestPluginLlmFacade:
             policy=_TrustPolicy(plugin_id="my-plugin"),
             sync_caller=fake_caller,
         )
-        png = b"fake-bytes"
+        png = _real_png_bytes()
         llm.complete_structured(
             instructions="Caption this",
             input=[PluginLlmImageInput(data=png, mime_type="image/png")],

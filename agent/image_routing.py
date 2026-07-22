@@ -667,6 +667,21 @@ def _file_to_data_url(path: Path) -> Optional[str]:
         )
         raw = transcoded
         mime = "image/png"
+
+    # Decode-validate before embedding: a truncated / corrupt file can keep
+    # a valid magic-byte signature while the pixel stream never actually
+    # decodes (issue #69078's root cause, mirrored at every other embed
+    # site). Once base64-embedded here it's baked into immutable
+    # conversation history, so this must happen before encoding, not after.
+    from tools.image_source import verify_decodable_image
+    decode_error = verify_decodable_image(raw, mime)
+    if decode_error is not None:
+        logger.warning(
+            "image_routing: %s failed decode validation, not attaching it: %s",
+            path, decode_error,
+        )
+        return None
+
     b64 = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{b64}"
 

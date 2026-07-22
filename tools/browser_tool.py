@@ -4201,6 +4201,27 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
 
         # Convert screenshot to base64 at full resolution.
         _screenshot_bytes = screenshot_path.read_bytes()
+
+        # Decode-validate before embedding: a truncated CDP screenshot (the
+        # byte-exact root cause of issue #69078) can keep a valid PNG magic
+        # signature + IHDR while the compressed pixel stream trails off
+        # mid-write. Once embedded here it's baked into immutable
+        # conversation history and permanently poisons the session on
+        # replay, so this must be caught before base64-encoding, not after.
+        from tools.image_source import verify_decodable_image
+        _decode_error = verify_decodable_image(_screenshot_bytes, "image/png")
+        if _decode_error is not None:
+            logger.warning(
+                "browser_vision: screenshot %s failed decode validation, "
+                "not embedding it: %s", screenshot_path, _decode_error)
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"Screenshot capture produced a corrupt or truncated "
+                    f"PNG ({_decode_error}). Retry the screenshot."
+                ),
+            }, ensure_ascii=False)
+
         _screenshot_b64 = base64.b64encode(_screenshot_bytes).decode("ascii")
         data_url = f"data:image/png;base64,{_screenshot_b64}"
 

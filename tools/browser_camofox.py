@@ -859,6 +859,21 @@ def camofox_vision(question: str, annotate: bool = False,
         with open(screenshot_path, "wb") as f:
             f.write(resp.content)
 
+        # Decode-validate before embedding: a truncated Camofox screenshot
+        # can keep a valid PNG magic signature + header while the pixel
+        # stream never actually decodes (issue #69078's root cause, mirrored
+        # at every other embed site). Once embedded here it's baked into
+        # immutable conversation history and permanently poisons the session
+        # on replay, so this must be caught before base64-encoding, not after.
+        from tools.image_source import verify_decodable_image
+        decode_error = verify_decodable_image(resp.content, "image/png")
+        if decode_error is not None:
+            return tool_error(
+                f"Screenshot capture produced a corrupt or truncated PNG "
+                f"({decode_error}). Retry the screenshot.",
+                success=False,
+            )
+
         # Encode for vision LLM
         img_b64 = base64.b64encode(resp.content).decode("utf-8")
 

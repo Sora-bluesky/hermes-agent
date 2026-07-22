@@ -1,6 +1,6 @@
 """
 Plugin LLM facade — host-owned LLM access for trusted plugins.
-==============================================================
+----------------------------------------------------------------
 
 Plugins built on Hermes Agent often need to make their own LLM calls
 out-of-band — a hook that rewrites a tool error before the user sees
@@ -425,8 +425,19 @@ def _build_structured_messages(
                 data = norm.get("data") or b""
                 if not isinstance(data, (bytes, bytearray)):
                     raise ValueError("image input 'data' must be bytes")
-                b64 = base64.b64encode(data).decode("ascii")
                 mime = norm.get("mime_type") or "image/png"
+                # Decode-validate before embedding: a plugin can hand us
+                # arbitrary bytes it read from disk/network, and a truncated
+                # or corrupt image would otherwise get base64-embedded into
+                # the request unnoticed (issue #69078's root cause, mirrored
+                # at every embed site that produces a data: URL).
+                from tools.image_source import verify_decodable_image
+                decode_error = verify_decodable_image(bytes(data), mime)
+                if decode_error is not None:
+                    raise ValueError(
+                        f"image input 'data' failed decode validation: {decode_error}"
+                    )
+                b64 = base64.b64encode(data).decode("ascii")
                 user_parts.append({
                     "type": "image_url",
                     "image_url": {"url": f"data:{mime};base64,{b64}"},

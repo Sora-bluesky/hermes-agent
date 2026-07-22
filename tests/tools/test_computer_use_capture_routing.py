@@ -39,10 +39,28 @@ _PNG_B64 = (
     "NgGAUgAAABCAABgukLHQAAAABJRU5ErkJggg=="
 )
 
-# 1×1 JPEG — used to verify mime detection works for either stream type.
+# 8×8 JPEG, fully decodable (at the _MIN_PROVIDER_IMAGE_DIMENSION floor —
+# smaller trips the unrelated "screenshot omitted, too small" branch) —
+# used to verify mime detection works for either stream type.
+# _capture_response now decode-validates via
+# tools.image_source.verify_decodable_image (issue #69078), so this must be
+# a real, complete JPEG rather than a truncated header-only fragment.
 _JPEG_B64 = (
-    "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAEBAQEBAQEBAQEBAQEBAQEBAQEB"
-    "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/"
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsL"
+    "DBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/"
+    "2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIy"
+    "MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAAIAAgDASIAAhEBAxEB/8QA"
+    "HwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUF"
+    "BAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkK"
+    "FhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1"
+    "dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXG"
+    "x8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEB"
+    "AQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAEC"
+    "AxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRom"
+    "JygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOE"
+    "hYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU"
+    "1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDwiiiirIP/"
+    "2Q=="
 )
 
 
@@ -146,6 +164,29 @@ class TestCaptureResponseDefaultPath:
         assert isinstance(resp, str)
         body = json.loads(resp)
         assert body["mode"] == "ax"
+
+    def test_corrupt_capture_degrades_to_ax_text_instead_of_embedding(self):
+        """Issue #69078, mirrored at the computer_use multimodal path:
+        cua-driver's capture can hand us a truncated/corrupt image that
+        still has a valid magic signature. Must degrade to the AX/SOM text
+        payload (same shape as the 'vision unavailable' branch) instead of
+        embedding it — never silently base64-embed corrupt bytes into
+        conversation history."""
+        from tools.computer_use import tool as cu_tool
+
+        # Valid PNG magic + IHDR, but everything after that (IDAT/IEND) is
+        # sliced off — passes a magic-byte sniff, fails an actual decode.
+        truncated_raw = base64.b64decode(_PNG_B64)[:24]
+        truncated = base64.b64encode(truncated_raw).decode("ascii")
+        cap = _make_capture(png_b64=truncated, mode="som")
+        with patch.object(cu_tool, "_should_route_through_aux_vision",
+                          return_value=False):
+            resp = cu_tool._capture_response(cap)
+
+        assert isinstance(resp, str), "must degrade to the AX/SOM JSON text payload"
+        body = json.loads(resp)
+        assert body.get("vision_unavailable") is True
+        assert "corrupt or truncated" in body["summary"]
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,19 @@
 """Tests for the Camofox browser backend."""
 
+import io
 import json
 from unittest.mock import MagicMock, patch
+
+from PIL import Image
+
+
+def _real_png_bytes(size=(4, 4)) -> bytes:
+    """A real, fully-decodable PNG. camofox_vision now decode-validates
+    screenshot bytes via tools.image_source.verify_decodable_image before
+    embedding them (issue #69078)."""
+    buf = io.BytesIO()
+    Image.new("RGB", size, color=(1, 2, 3)).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 from tools.browser_camofox import (
@@ -377,7 +389,7 @@ class TestCamofoxVisionConfig:
 
         snapshot_text = '- button "Submit"\n'
         raw_resp = MagicMock()
-        raw_resp.content = b"fakepng"
+        raw_resp.content = _real_png_bytes()
         mock_get_raw.return_value = raw_resp
         mock_get.return_value = {"snapshot": snapshot_text}
 
@@ -409,7 +421,7 @@ class TestCamofoxVisionConfig:
 
         snapshot_text = '- button "Submit"\n'
         raw_resp = MagicMock()
-        raw_resp.content = b"fakepng"
+        raw_resp.content = _real_png_bytes()
         mock_get_raw.return_value = raw_resp
         mock_get.return_value = {"snapshot": snapshot_text}
 

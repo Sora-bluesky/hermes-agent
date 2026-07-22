@@ -1,10 +1,21 @@
 """Tests for Lightpanda engine support in browser_tool.py."""
 
+import io
 import json
 import os
 from unittest.mock import MagicMock, patch
 
 import pytest
+from PIL import Image
+
+
+def _real_png_bytes(size=(4, 4)) -> bytes:
+    """A real, fully-decodable PNG. browser_vision now decode-validates
+    screenshot bytes via tools.image_source.verify_decodable_image before
+    embedding them."""
+    buf = io.BytesIO()
+    Image.new("RGB", size, color=(255, 0, 0)).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +414,7 @@ class TestLightpandaFallbackWarning:
         import tools.browser_tool as bt
 
         chrome_shot = tmp_path / "chrome.png"
-        chrome_shot.write_bytes(b"\x89PNG" + b"0" * 128)
+        chrome_shot.write_bytes(_real_png_bytes())
 
         class _Msg:
             content = "Example Domain screenshot"
@@ -460,7 +471,7 @@ class TestLightpandaFallbackWarning:
         import tools.browser_tool as bt
 
         chrome_shot = tmp_path / "chrome-structured.png"
-        chrome_shot.write_bytes(b"\x89PNG" + b"0" * 128)
+        chrome_shot.write_bytes(_real_png_bytes())
 
         class _Msg:
             content = "Example Domain screenshot"

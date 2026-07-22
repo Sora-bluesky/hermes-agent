@@ -644,7 +644,14 @@ class TestCaptureResponse:
         from tools.computer_use.backend import CaptureResult, UIElement
         from tools.computer_use import tool as cu_tool
 
-        fake_png = "iVBORw0KGgo="
+        # Real, fully-decodable 8x8 PNG — _capture_response now
+        # decode-validates via tools.image_source.verify_decodable_image
+        # (issue #69078), so this must survive an actual PIL .verify()+.load(),
+        # not just the magic-byte prefix "iVBORw0KGgo=" used to.
+        fake_png = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAADUlEQVR4nG"
+            "NgGAUgAAABCAABgukLHQAAAABJRU5ErkJggg=="
+        )
         elements = [
             UIElement(index=i + 1, role="AXButton", label=f"el-{i}", bounds=(0, 0, 1, 1))
             for i in range(600)

@@ -1,13 +1,25 @@
 """Tests for browser_console tool and browser_vision annotate param."""
 
+import io
 import json
 import os
 import sys
 from unittest.mock import patch, MagicMock
 
 import pytest
+from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def _real_png_bytes(size=(4, 4)) -> bytes:
+    """A real, fully-decodable PNG. browser_vision now decode-validates
+    screenshot bytes via tools.image_source.verify_decodable_image before
+    embedding them, so fixtures feeding it must survive an actual PIL
+    .verify()+.load()."""
+    buf = io.BytesIO()
+    Image.new("RGB", size, color=(255, 0, 0)).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 # ── browser_console ──────────────────────────────────────────────────
@@ -390,7 +402,7 @@ class TestBrowserVisionConfig:
         shots_dir = tmp_path / "browser_screenshots"
         shots_dir.mkdir()
         screenshot = shots_dir / "shot.png"
-        screenshot.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        screenshot.write_bytes(_real_png_bytes())
         return shots_dir, screenshot
 
     def test_browser_vision_uses_configured_temperature_and_timeout(self, tmp_path):

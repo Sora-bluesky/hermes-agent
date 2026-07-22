@@ -147,7 +147,22 @@ def _guess_image_mime_from_path(path: Path) -> str | None:
     }.get(suffix)
 
 
-def _image_data_url(data: bytes, mime_type: str) -> str:
+def _image_data_url(data: bytes, mime_type: str) -> str | None:
+    """Base64-embed raw image bytes as a data URL, decode-validating first.
+
+    The single shared encode helper for every ACP path that embeds raw
+    image bytes (resource links, embedded blobs) — decode-validating here
+    means both callers get the issue #69078 gate for free instead of each
+    call site re-deriving (or skipping) it. Returns ``None`` when the bytes
+    fail decode validation (truncated / corrupt / unsafe to decode); the
+    caller is responsible for falling back to a text notice.
+    """
+    from tools.image_source import verify_decodable_image
+
+    decode_error = verify_decodable_image(data, mime_type)
+    if decode_error is not None:
+        logger.warning("ACP image failed decode validation, not embedding it: %s", decode_error)
+        return None
     return f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"
 
 
@@ -270,10 +285,28 @@ def _resource_link_to_parts(block: ResourceContentBlock) -> list[dict[str, Any]]
                     body=f"[Could not read attached image: {exc}]",
                 ),
             }]
+
+        # _image_data_url decode-validates before embedding (issue #69078: a
+        # truncated / corrupt file can keep a valid magic-byte signature
+        # while the pixel stream never actually decodes) and returns None
+        # on failure — this must happen before base64-encoding, not after,
+        # since it's about to be baked into immutable conversation history.
+        data_url = _image_data_url(data, image_mime)
+        if data_url is None:
+            return [{
+                "type": "text",
+                "text": _format_resource_text(
+                    uri=uri,
+                    name=name,
+                    title=title,
+                    body="[Attached image is corrupt or truncated and could not be embedded.]",
+                ),
+            }]
+
         display = _resource_display_name(uri, name=name, title=title)
         return [
             {"type": "text", "text": f"[Attached image: {display}]\nURI: {uri}"},
-            {"type": "image_url", "image_url": {"url": _image_data_url(data, image_mime)}},
+            {"type": "image_url", "image_url": {"url": data_url}},
         ]
 
     try:
@@ -340,10 +373,21 @@ def _embedded_resource_to_parts(block: EmbeddedResourceContentBlock) -> list[dic
                         body=f"[Embedded image too large to inline: {len(data)} bytes, cap={_MAX_ACP_RESOURCE_BYTES}]",
                     ),
                 }]
+            # _image_data_url decode-validates before embedding (issue
+            # #69078) and returns None on failure.
+            data_url = _image_data_url(data, mime_type or "image/png")
+            if data_url is None:
+                return [{
+                    "type": "text",
+                    "text": _format_resource_text(
+                        uri=uri,
+                        body="[Embedded image is corrupt or truncated and could not be embedded.]",
+                    ),
+                }]
             display = _resource_display_name(uri)
             return [
                 {"type": "text", "text": f"[Attached image: {display}]" + (f"\nURI: {uri}" if uri else "")},
-                {"type": "image_url", "image_url": {"url": _image_data_url(data, mime_type or "image/png")}},
+                {"type": "image_url", "image_url": {"url": data_url}},
             ]
 
         text = _decode_text_bytes(data[:_MAX_ACP_RESOURCE_BYTES], mime_type)
@@ -387,8 +431,33 @@ def _image_block_to_openai_part(block: ImageContentBlock) -> dict[str, Any] | No
     mime_type = str(getattr(block, "mime_type", "") or "image/png").strip() or "image/png"
 
     if data:
-        url = data if data.startswith("data:") else f"data:{mime_type};base64,{data}"
+        # Inline base64 image bytes (the "data" field, as opposed to a
+        # "uri" reference the provider fetches itself) must be
+        # decode-validated before embedding — same issue #69078 gate as
+        # every other raw-bytes embed path.
+        if data.startswith("data:"):
+            # Already a full data: URL — extract the base64 payload to
+            # validate, but preserve the original string as-is on success.
+            _, _, encoded = data.partition(",")
+            raw = encoded
+            url = data
+        else:
+            raw = data
+            url = f"data:{mime_type};base64,{data}"
+        try:
+            decoded = base64.b64decode(raw, validate=True)
+        except Exception:
+            logger.warning("ACP image block has invalid base64 data, dropping it")
+            return None
+        from tools.image_source import verify_decodable_image
+        decode_error = verify_decodable_image(decoded, mime_type)
+        if decode_error is not None:
+            logger.warning("ACP image block failed decode validation, dropping it: %s", decode_error)
+            return None
     elif uri:
+        # A URI reference (http(s):// or provider-fetched) — not raw bytes
+        # we're embedding ourselves, so there's nothing to decode-validate
+        # here; the provider (or a downstream resolver) handles the fetch.
         url = uri
     else:
         return None

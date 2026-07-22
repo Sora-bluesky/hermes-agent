@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import base64
+import io
 from pathlib import Path
 from unittest.mock import patch
+
+from PIL import Image
 
 
 from agent.image_routing import (
@@ -366,6 +369,21 @@ def _png_bytes() -> bytes:
     )
 
 
+def _jpeg_bytes(size=(4, 4)) -> bytes:
+    """Return a real, fully-decodable JPEG — image_routing._file_to_data_url
+    now decode-validates via tools.image_source.verify_decodable_image, so
+    fixtures feeding it must survive an actual PIL .verify()+.load()."""
+    buf = io.BytesIO()
+    Image.new("RGB", size, color=(10, 20, 30)).save(buf, format="JPEG")
+    return buf.getvalue()
+
+
+def _webp_bytes(size=(4, 4)) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", size, color=(40, 50, 60)).save(buf, format="WEBP")
+    return buf.getvalue()
+
+
 class TestBuildNativeContentParts:
     def test_text_then_image(self, tmp_path: Path):
         img = tmp_path / "cat.png"
@@ -448,17 +466,17 @@ class TestBuildNativeContentParts:
         assert str(img2) in text_part["text"]
 
     def test_mime_inference_jpg(self, tmp_path: Path):
-        # Real JPEG bytes (SOI marker FF D8 FF): sniffing now wins over suffix.
+        # Real, decodable JPEG bytes: sniffing now wins over suffix.
         img = tmp_path / "photo.jpg"
-        img.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01" + b"\x00" * 32)
+        img.write_bytes(_jpeg_bytes())
         parts, _ = build_native_content_parts("x", [str(img)])
         url = parts[1]["image_url"]["url"]
         assert url.startswith("data:image/jpeg;base64,")
 
     def test_mime_inference_webp(self, tmp_path: Path):
-        # Real WEBP bytes (RIFF....WEBP): sniffing now wins over suffix.
+        # Real, decodable WEBP bytes: sniffing now wins over suffix.
         img = tmp_path / "pic.webp"
-        img.write_bytes(b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 32)
+        img.write_bytes(_webp_bytes())
         parts, _ = build_native_content_parts("", [str(img)])
         url = parts[1]["image_url"]["url"]
         assert url.startswith("data:image/webp;base64,")
@@ -491,8 +509,14 @@ class TestLargeImageHandling:
         from agent import image_routing as _ir
 
         img = tmp_path / "medium.png"
-        # 200 KB of real bytes; not huge but enough to verify no size gate fires.
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"X" * 200_000)
+        # Random pixel data compresses poorly, so a real (decodable) PNG
+        # still lands around 200 KB+ on disk — enough to verify no size
+        # gate fires without needing a slow multi-MB fixture.
+        import os as _os
+        noise = Image.frombytes("RGB", (300, 300), _os.urandom(300 * 300 * 3))
+        buf = io.BytesIO()
+        noise.save(buf, format="PNG")
+        img.write_bytes(buf.getvalue())
         url = _ir._file_to_data_url(img)
         assert url is not None
         assert url.startswith("data:image/png;base64,")
@@ -822,7 +846,7 @@ class TestFormatCompatibility:
         from agent.image_routing import _file_to_data_url
 
         img_path = tmp_path / "ok.jpg"
-        img_path.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9")
+        img_path.write_bytes(_jpeg_bytes())
         url = _file_to_data_url(img_path)
         assert url is not None
         assert url.startswith("data:image/jpeg;base64,")

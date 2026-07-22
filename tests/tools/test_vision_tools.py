@@ -1,6 +1,7 @@
 """Tests for tools/vision_tools.py — URL validation, type hints, error logging."""
 
 import base64
+import io
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ from typing import Awaitable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from PIL import Image
 
 from tools.vision_tools import (
     _validate_image_url,
@@ -24,6 +26,21 @@ from tools.vision_tools import (
     vision_analyze_tool,
     check_vision_requirements,
 )
+
+
+def _real_png_bytes(size=(4, 4)) -> bytes:
+    """A real, fully-decodable PNG — tools/image_source._finalize now decode-
+    validates (not just magic-byte sniffs) any bytes routed through
+    resolve_image_source, so fixtures feeding that path need real pixels."""
+    buf = io.BytesIO()
+    Image.new("RGB", size, color=(255, 0, 0)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _real_jpeg_bytes(size=(4, 4)) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", size, color=(0, 255, 0)).save(buf, format="JPEG")
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +403,7 @@ class TestErrorLoggingExcInfo:
         # vision temp file, then the analysis runs — exercising the temp-cleanup
         # path in the finally block. A tiny valid JPEG (magic bytes) passes the
         # resolver's magic-byte sniff.
-        jpeg_b64 = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 32).decode("ascii")
+        jpeg_b64 = base64.b64encode(_real_jpeg_bytes()).decode("ascii")
         data_url = f"data:image/jpeg;base64,{jpeg_b64}"
 
         with (
@@ -425,7 +442,7 @@ class TestVisionConfig:
     @pytest.mark.asyncio
     async def test_vision_uses_configured_temperature_and_timeout(self, tmp_path):
         img = tmp_path / "test.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        img.write_bytes(_real_png_bytes())
 
         mock_response = MagicMock()
         mock_choice = MagicMock()
@@ -455,7 +472,7 @@ class TestVisionConfig:
     @pytest.mark.asyncio
     async def test_vision_defaults_temperature_when_config_omits_it(self, tmp_path):
         img = tmp_path / "test.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        img.write_bytes(_real_png_bytes())
 
         mock_response = MagicMock()
         mock_choice = MagicMock()
@@ -634,7 +651,7 @@ class TestTildeExpansion:
         fake_home = tmp_path / "fakehome"
         fake_home.mkdir()
         img = fake_home / "test_image.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        img.write_bytes(_real_png_bytes())
 
         # Windows expanduser() prefers USERPROFILE over HOME; POSIX uses HOME.
         monkeypatch.setenv("HOME", str(fake_home))
@@ -690,7 +707,7 @@ class TestFileUriSupport:
     async def test_file_uri_resolved_as_local_path(self, tmp_path):
         """file:///absolute/path should be treated as a local file."""
         img = tmp_path / "photo.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        img.write_bytes(_real_png_bytes())
 
         mock_response = MagicMock()
         mock_choice = MagicMock()
@@ -736,7 +753,12 @@ class TestBase64SizeLimit:
     async def test_oversized_image_rejected_before_api_call(self, tmp_path):
         """Images exceeding the 20 MB hard limit should fail with a clear error."""
         img = tmp_path / "huge.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * (4 * 1024 * 1024))
+        # Random noise compresses poorly, so a real (decodable) PNG still
+        # lands comfortably over the patched 1000-byte limit below.
+        noise = Image.frombytes("RGB", (64, 64), os.urandom(64 * 64 * 3))
+        buf = io.BytesIO()
+        noise.save(buf, format="PNG")
+        img.write_bytes(buf.getvalue())
 
         # Patch the hard limit to a small value so the test runs fast.
         with patch("tools.vision_tools._MAX_BASE64_BYTES", 1000), \
@@ -751,7 +773,7 @@ class TestBase64SizeLimit:
     async def test_small_image_not_rejected(self, tmp_path):
         """Images well under the limit should pass the size check."""
         img = tmp_path / "small.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+        img.write_bytes(_real_png_bytes())
 
         mock_response = MagicMock()
         mock_choice = MagicMock()
@@ -782,7 +804,7 @@ class TestErrorClassification:
     async def test_invalid_request_error_gives_image_guidance(self, tmp_path):
         """An invalid_request_error from the API should mention image size/format."""
         img = tmp_path / "test.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        img.write_bytes(_real_png_bytes())
 
         api_error = Exception(
             "Error code: 400 - {'type': 'error', 'error': "

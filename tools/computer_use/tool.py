@@ -705,6 +705,42 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
         if not _mime:
             _b64_prefix = cap.png_b64[:8]
             _mime = "image/jpeg" if _b64_prefix.startswith("/9j/") else "image/png"
+
+        # Decode-validate before embedding: cua-driver's capture can hand us
+        # a truncated/corrupt image (same class of bug as issue #69078's
+        # browser_cdp screenshot) that still has a valid magic signature.
+        # Once embedded in this multimodal envelope it's baked into
+        # immutable conversation history, so this must be caught here, not
+        # after the provider rejects it on some later turn.
+        try:
+            import base64 as _base64
+            _decoded = _base64.b64decode(cap.png_b64, validate=True)
+        except Exception:
+            _decoded = None
+        from tools.image_source import verify_decodable_image
+        _decode_error = None if _decoded is None else verify_decodable_image(_decoded, _mime)
+        if _decoded is None or _decode_error is not None:
+            summary_lines.append(
+                "  (screenshot capture produced a corrupt or truncated "
+                f"image{': ' + _decode_error if _decode_error else ''}; "
+                "screenshot omitted. Element-index actions still work — "
+                "drive via the element list above.)"
+            )
+            payload = {
+                "mode": cap.mode,
+                "width": response_width,
+                "height": response_height,
+                "app": cap.app,
+                "window_title": cap.window_title,
+                "elements": [_element_to_dict(e) for e in visible_elements],
+                "total_elements": total_elements,
+                "summary": "\n".join(summary_lines),
+                "vision_unavailable": True,
+            }
+            if truncated_elements:
+                payload["truncated_elements"] = truncated_elements
+            return json.dumps(payload)
+
         # The multimodal response carries the screenshot, not the AX
         # elements array, so a "response truncated to N of M elements"
         # note would be inaccurate — skip it on this branch.

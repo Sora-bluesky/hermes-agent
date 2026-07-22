@@ -69,6 +69,31 @@ class NotAnImage(ImageResolutionError):
     pass
 
 
+class CorruptImage(NotAnImage):
+    """Magic bytes and header look right, but the image is unsafe to embed.
+
+    Two distinct failure modes both raise this:
+
+    1. Truncated / corrupt pixel data — a truncated download (or a screenshot
+       tool that wrote a partial file, see issue #69078) can keep a fully-
+       formed PNG/JPEG signature and header while the compressed data trails
+       off mid-stream. The magic-byte sniff in ``_finalize`` can't catch
+       that — it only looks at the first few bytes — so a corrupt file
+       passes the sniff, gets base64-embedded into conversation history, and
+       permanently poisons the session on replay (the bad bytes are
+       immutable history).
+    2. Decompression bombs — a small, well-formed file can still decode to
+       an enormous pixel buffer. See ``verify_decodable_image`` for the
+       pixel-count ceiling and PIL bomb-warning promotion that catch this
+       before ``.load()`` allocates the buffer.
+
+    This subclasses ``NotAnImage`` so existing callers that only catch the
+    base class keep working, while callers that care can catch this
+    specifically to distinguish "not an image at all" from "unsafe image".
+    """
+    pass
+
+
 @dataclass
 class ResolveContext:
     task_id: Optional[str] = None
@@ -316,8 +341,204 @@ async def _resolve_container_fallback(p: Path, ctx: ResolveContext, src: str) ->
     return _finalize(data, "", "container", src)
 
 
+_PIL_IMPORT_WARNED = False
+_PIL_CODEC_WARNED: set = set()
+
+# PIL's own default decompression-bomb ceiling (Image.MAX_IMAGE_PIXELS). We
+# pin an explicit constant rather than reading the PIL attribute at call time
+# so behavior doesn't silently change if something in the process mutates
+# that global (some libraries do, to allow legitimately huge images).
+_MAX_DECODE_PIXELS = 89_478_485
+
+# A minimal, statically-embedded, known-good 1x1 image per format — used
+# ONLY to probe whether this Pillow build can actually decode the format
+# (as opposed to merely having the extension registered). These are NOT
+# generated via PIL.Image(...).save() at call time: if the *encoder* were
+# also missing/broken, generating the probe on the fly would confuse "can't
+# create the probe" with "can't decode the format", and would burn a
+# round-trip through PIL on every check. Regenerate with:
+#   Image.new("RGB", (1, 1), (10, 20, 30)).save(buf, format=<FMT>)
+_MIME_TO_PROBE_BYTES = {
+    "image/png": bytes.fromhex(
+        "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+        "0000000c49444154789c63e0129103000068003d5408a3f70000000049454e44ae"
+        "426082"
+    ),
+    "image/jpeg": None,  # populated lazily below (JPEG probes are large)
+    "image/gif": bytes.fromhex(
+        "474946383761010001008100000a141e0000000000000000002c000000000100"
+        "010000080400010404003b"
+    ),
+    "image/bmp": bytes.fromhex(
+        "424d3a0000000000000036000000280000000100000001000000010018000000"
+        "000004000000c40e0000c40e000000000000000000001e140a00"
+    ),
+    "image/webp": bytes.fromhex(
+        "524946462e0000005745425056503820220000007001009d012a01000100014"
+        "0262594027401400000fefc378157f7d4e83e2be00000"
+    ),
+}
+
+
+def _decoder_probe_bytes(mime: str) -> Optional[bytes]:
+    probe = _MIME_TO_PROBE_BYTES.get(mime)
+    if probe is not None:
+        return probe
+    if mime == "image/jpeg":
+        # JPEG's minimal valid file is a few hundred bytes (Huffman tables
+        # etc.) — not worth hand-transcribing as a hex literal, so this one
+        # IS generated once and cached. A JPEG encoder missing but decoder
+        # present (or vice versa) is not a realistic partial-build shape
+        # (they ship as one libjpeg binding), so the "probe generation
+        # itself fails" edge case this file's other entries avoid doesn't
+        # meaningfully apply here.
+        try:
+            from PIL import Image as _PILImage
+            import io as _io
+            buf = _io.BytesIO()
+            _PILImage.new("RGB", (1, 1), (10, 20, 30)).save(buf, format="JPEG")
+            probe = buf.getvalue()
+            _MIME_TO_PROBE_BYTES["image/jpeg"] = probe
+        except Exception:
+            return None
+    return probe
+
+
+def _decoder_available_for_mime(mime: str) -> bool:
+    """True if this Pillow build can actually DECODE ``mime``, not just that
+    it has the extension/plugin registered.
+
+    Partial Pillow builds (e.g. no libwebp at compile time) can still import
+    cleanly and register the ``.webp`` extension, yet fail to open a *valid*
+    WEBP file — that's a missing/broken codec, not a corrupt image, and must
+    not be conflated with :class:`CorruptImage`. We check this the same way
+    the real validation does: open + load a small, known-good file of the
+    format and see whether Pillow actually decodes it.
+    """
+    probe = _decoder_probe_bytes(mime)
+    if probe is None:
+        return True  # unknown mime, or probe unavailable — let the normal
+        # open/verify path decide rather than silently skipping validation.
+    try:
+        from PIL import Image as _PILImage
+        import io as _io
+        with _PILImage.open(_io.BytesIO(probe)) as _img:
+            _img.load()
+        return True
+    except Exception:
+        return False
+
+
+def verify_decodable_image(data: bytes, mime: str) -> Optional[str]:
+    """Decode-validate raster bytes; return an error string, or None if OK.
+
+    This is the single, reusable embed-time gate: ANY call site about to
+    base64-embed image bytes into an outgoing message (conversation history,
+    a native multimodal tool result, an ACP resource block, ...) should route
+    through this before doing so. The magic-byte sniff used elsewhere only
+    inspects the first few bytes, so a truncated file (cut mid-IDAT, mid-scan-
+    line, etc.) that still has a valid signature + header sails through it
+    untouched — the file *looks* like a PNG at a glance but the pixel stream
+    never actually decodes. That's the byte-exact root cause paultaki traced
+    in issue #69078: a browser_cdp ``Page.captureScreenshot`` screenshot got
+    truncated on disk, and every existing gate (extension, magic bytes,
+    declared media_type) happily passed it through to get base64-embedded
+    into immutable conversation history, permanently poisoning the session.
+
+    PIL gotcha: ``Image.verify()`` alone is NOT enough — it only checks
+    structural integrity (headers/chunks) and can pass on a file that still
+    fails to decode its actual pixel data. We must also ``.load()`` it, which
+    forces the pixel stream to be read. ``verify()`` invalidates the Image
+    object for further use, so we re-open the same bytes before ``.load()``.
+
+    Also guards against decompression bombs: ``_MAX_INGEST_BYTES`` bounds the
+    *compressed* size, but a small, well-formed PNG can still decode to
+    hundreds of megabytes of pixel data (e.g. a highly-compressible solid-
+    color image at absurd dimensions). We check the pixel count from the
+    header (available without a full decode) against the same ceiling PIL
+    itself defaults to (``Image.MAX_IMAGE_PIXELS``), and additionally promote
+    PIL's own ``DecompressionBombWarning`` to an error scoped to this call so
+    a bomb that slips past the explicit check is still caught before ``load()``
+    can allocate the full pixel buffer.
+
+    SVG has no pixel stream to decode here (it's rasterized to PNG later by
+    the vision call sites), so it's skipped.
+
+    Fail-open on a missing Pillow or a missing codec for this mime: Pillow is
+    a soft dependency everywhere else in the vision path (see
+    ``_image_exceeds_dimension``), and we never want a missing optional
+    install — or a Pillow build without a particular codec — to break
+    embedding of an otherwise-valid image.
+    """
+    if mime == "image/svg+xml":
+        return None
+    try:
+        from PIL import Image as _PILImage, UnidentifiedImageError as _PILUnidentifiedImageError
+    except ImportError:
+        global _PIL_IMPORT_WARNED
+        if not _PIL_IMPORT_WARNED:
+            _PIL_IMPORT_WARNED = True
+            import logging as _logging
+            _logging.getLogger(__name__).debug(
+                "Pillow not installed — skipping decode validation of "
+                "embedded images (magic-byte sniff still applies)")
+        return None
+
+    if not _decoder_available_for_mime(mime):
+        if mime not in _PIL_CODEC_WARNED:
+            _PIL_CODEC_WARNED.add(mime)
+            import logging as _logging
+            _logging.getLogger(__name__).debug(
+                "No Pillow codec registered for %s — skipping decode "
+                "validation for this format (magic-byte sniff still "
+                "applies)", mime)
+        return None
+
+    import io as _io
+
+    # NOTE on thread safety: an earlier version of this function wrapped the
+    # open/verify/load calls in `warnings.catch_warnings()` +
+    # `simplefilter("error", ...)` to promote PIL's DecompressionBombWarning
+    # to an exception. `warnings.catch_warnings()` mutates the PROCESS-GLOBAL
+    # warning filter for the duration of the `with` block — under the
+    # threaded gateway, a concurrent request's unrelated
+    # DecompressionBombWarning could get promoted to an exception too (or
+    # vice versa), a real cross-request bug caught in review. The explicit
+    # pixel-count check below runs BEFORE `.load()` and is sufficient on its
+    # own to reject an oversized image without ever calling `.load()` on it,
+    # so the warning-promotion was redundant defense — removed rather than
+    # made thread-safe via a module-level `Image.MAX_IMAGE_PIXELS` set,
+    # since the explicit pre-check alone already closes the gap.
+    try:
+        with _PILImage.open(_io.BytesIO(data)) as _probe:
+            _probe.verify()
+        # verify() invalidates the Image object — re-open the same bytes and
+        # force a full pixel decode, which is what actually catches a
+        # truncated compressed stream that a structural verify() misses.
+        with _PILImage.open(_io.BytesIO(data)) as _decoded:
+            width, height = _decoded.size
+            pixels = width * height
+            if pixels > _MAX_DECODE_PIXELS:
+                return (
+                    f"{mime} image is {width}x{height} ({pixels:,} px), "
+                    f"which exceeds the {_MAX_DECODE_PIXELS:,} px "
+                    f"decode-safety ceiling (decompression-bomb guard)"
+                )
+            _decoded.load()
+    except _PILImage.DecompressionBombError as exc:
+        return f"{mime} image rejected as a decompression bomb: {exc}"
+    except (_PILUnidentifiedImageError, OSError, ValueError, SyntaxError) as exc:
+        return f"{mime} bytes failed to decode: {exc}"
+    return None
+
+
+# Internal alias kept for readability at call sites within this module.
+_verify_decodable_image = verify_decodable_image
+
+
 def _finalize(data: bytes, declared_mime: str, origin: str, src: str) -> ResolvedImage:
-    """Intrinsic-correctness chokepoint: ingest byte cap + magic-byte sniff.
+    """Intrinsic-correctness chokepoint: ingest byte cap + magic-byte sniff +
+    decode validation.
 
     The cap here is the generous 50MB *ingest* budget, not the 20MB provider
     payload cap — a 20-50MB image must survive this step so the call site can
@@ -335,4 +556,10 @@ def _finalize(data: bytes, declared_mime: str, origin: str, src: str) -> Resolve
             # only ingest raster images).
             return ResolvedImage(data=data, mime="image/svg+xml", origin=origin)
         raise NotAnImage("source is not a recognized image", src=src, origin=origin)
+    decode_error = verify_decodable_image(data, sniffed)
+    if decode_error is not None:
+        raise CorruptImage(
+            f"image has a valid {sniffed} header but is unsafe to embed: "
+            f"{decode_error}",
+            src=src, origin=origin)
     return ResolvedImage(data=data, mime=sniffed, origin=origin)
