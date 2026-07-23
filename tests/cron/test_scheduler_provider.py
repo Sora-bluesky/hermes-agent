@@ -702,33 +702,124 @@ class TestGuardJobCredentialExfil:
 
 
 def test_no_live_gateway_gate(monkeypatch):
-    """_no_live_gateway: False while a gateway PID is live, True when none,
-    True (fail open — cron must never lose its trigger) on probe errors."""
+    """_no_live_gateway: False while the gateway runtime lock is held (a gateway
+    owns this HERMES_HOME), True when it is free, and True (fail open, so cron
+    never loses its trigger) on probe errors. The gate reads the runtime lock
+    directly, not a cached PID, so it is authoritative up to the instant."""
     import gateway.status as status
     from hermes_cli.web_server import _no_live_gateway
 
-    monkeypatch.setattr(status, "get_running_pid_cached", lambda *a, **k: 4321)
+    monkeypatch.setattr(status, "is_gateway_runtime_lock_active", lambda *a, **k: True)
     assert _no_live_gateway() is False
 
-    monkeypatch.setattr(status, "get_running_pid_cached", lambda *a, **k: None)
+    monkeypatch.setattr(status, "is_gateway_runtime_lock_active", lambda *a, **k: False)
     assert _no_live_gateway() is True
 
     def _boom(*a, **k):
         raise RuntimeError("probe failed")
 
-    monkeypatch.setattr(status, "get_running_pid_cached", _boom)
+    monkeypatch.setattr(status, "is_gateway_runtime_lock_active", _boom)
     assert _no_live_gateway() is True
 
 
+def test_authoritative_gate_defers_before_get_due_jobs(monkeypatch, tmp_path):
+    """When a gateway owns the runtime lock, the desktop tick must stop at the
+    can_dispatch gate BEFORE the mutating get_due_jobs, so no recurring job is
+    advanced/persisted and then stranded. Re-checking AFTER get_due_jobs is the
+    stranding trap that reverted the earlier redesign; this proves the boundary
+    is before the mutation (#66629)."""
+    import cron.scheduler as scheduler
+    import gateway.status as status
+    from hermes_cli.web_server import _no_live_gateway
+
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda *a, **k: tmp_path)
+    monkeypatch.setattr(status, "is_gateway_runtime_lock_active", lambda *a, **k: True)
+
+    calls = {"get_due_jobs": 0}
+
+    def _record(*a, **k):
+        calls["get_due_jobs"] += 1
+        return []
+
+    monkeypatch.setattr(scheduler, "get_due_jobs", _record)
+
+    result = scheduler.tick(sync=True, can_dispatch=_no_live_gateway)
+
+    assert result == 0
+    assert calls["get_due_jobs"] == 0, "get_due_jobs ran despite a live gateway owner"
+
+
+def test_drain_inflight_tick_blocks_while_held_and_returns_when_free(monkeypatch, tmp_path):
+    """drain_inflight_tick returns False while another holder keeps
+    cron/.tick.lock (it can never acquire, so it deterministically times out) and
+    True once the lock is free. This is the gateway-startup barrier: the
+    gateway's adapters come up strictly after any in-flight desktop tick finished
+    committing under the lock, so the hand-off is closed by lock ordering rather
+    than a timing assumption (#66629)."""
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda *a, **k: tmp_path)
+    lock_dir, lock_file = scheduler._get_lock_paths()
+    lock_dir.mkdir(parents=True, exist_ok=True)
+
+    # Free lock: acquires at once -> True (deterministic, no timing).
+    assert scheduler.drain_inflight_tick(timeout=5.0) is True
+
+    # Hold .tick.lock the way an in-flight tick does. drain can NEVER acquire
+    # while it is held, so a short timeout deterministically returns False --
+    # the barrier provably did not pass the in-flight tick.
+    holder = open(lock_file, "w", encoding="utf-8")
+    try:
+        if scheduler.fcntl:
+            scheduler.fcntl.flock(holder, scheduler.fcntl.LOCK_EX | scheduler.fcntl.LOCK_NB)
+        elif scheduler.msvcrt:
+            scheduler.msvcrt.locking(holder.fileno(), scheduler.msvcrt.LK_NBLCK, 1)
+        assert scheduler.drain_inflight_tick(timeout=0.3) is False
+    finally:
+        holder.close()
+
+    # After the in-flight tick releases, the barrier passes again.
+    assert scheduler.drain_inflight_tick(timeout=5.0) is True
+
+
+def test_probe_failure_fails_open_so_cron_still_fires(monkeypatch, tmp_path):
+    """If the owner probe errors, the gate fails OPEN and the desktop tick still
+    runs: a desktop-only user's cron must never silently stop on a transient
+    lock-probe error. This is the deliberate second residual -- a rare double
+    delivery if a gateway happened to be up during the error -- traded for
+    cron-liveness, which matters more for the desktop ticker (#66629)."""
+    import cron.scheduler as scheduler
+    import gateway.status as status
+    from hermes_cli.web_server import _no_live_gateway
+
+    def _boom(*a, **k):
+        raise OSError("lock probe failed")
+
+    monkeypatch.setattr(status, "is_gateway_runtime_lock_active", _boom)
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda *a, **k: tmp_path)
+
+    calls = {"get_due_jobs": 0}
+
+    def _record(*a, **k):
+        calls["get_due_jobs"] += 1
+        return []
+
+    monkeypatch.setattr(scheduler, "get_due_jobs", _record)
+
+    scheduler.tick(sync=True, can_dispatch=_no_live_gateway)
+    assert calls["get_due_jobs"] == 1, "cron did not fire when the owner probe errored"
+
+
 def test_desktop_ticker_defers_while_gateway_running(monkeypatch):
-    """With a live gateway on the same HERMES_HOME the desktop ticker skips
-    every tick; when the gateway stops, ticking resumes on its own."""
+    """With a gateway holding the runtime lock on the same HERMES_HOME the
+    desktop ticker skips every tick; when the gateway releases it, ticking
+    resumes on its own."""
     import gateway.status as status
     from hermes_cli.web_server import _start_desktop_cron_ticker
 
-    gateway_pid = {"pid": 4321}
+    lock_held = {"v": True}
     monkeypatch.setattr(
-        status, "get_running_pid_cached", lambda *a, **k: gateway_pid["pid"]
+        status, "is_gateway_runtime_lock_active", lambda *a, **k: lock_held["v"]
     )
 
     calls = []
@@ -744,7 +835,7 @@ def test_desktop_ticker_defers_while_gateway_running(monkeypatch):
         t.start()
         time.sleep(0.05)
         assert calls == [], "desktop ticker ticked while a gateway was running"
-        gateway_pid["pid"] = None  # gateway stopped
+        lock_held["v"] = False  # gateway stopped, runtime lock released
         assert _wait_until(lambda: len(calls) >= 1), \
             "desktop ticker did not resume after the gateway stopped"
         stop.set()

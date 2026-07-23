@@ -145,20 +145,30 @@ _log = logging.getLogger(__name__)
 def _no_live_gateway() -> bool:
     """Dispatch gate for the desktop cron ticker (#66629).
 
-    Returns False while a live gateway owns this HERMES_HOME. The gateway's
-    ticker delivers through live platform adapters (interactive cards, rich
-    messages); the desktop ticker's standalone path silently degrades those to
-    plain text — so while a gateway is up, the desktop ticker must defer every
-    tick to it instead of racing it for ``cron/.tick.lock``. Evaluated per
-    tick, so the desktop ticker resumes automatically when the gateway stops.
+    Returns False while a gateway owns this HERMES_HOME. The gateway's ticker
+    delivers through live platform adapters (interactive cards, rich messages);
+    the desktop ticker's standalone path silently degrades those to plain text,
+    so while a gateway is up the desktop ticker must defer every tick to it
+    instead of racing it for ``cron/.tick.lock``.
+
+    This probes the gateway's runtime lock directly rather than a cached PID
+    snapshot: the gateway holds ``gateway.lock`` for its entire life, from
+    before its adapters go live (``acquire_gateway_runtime_lock`` runs ahead of
+    ``runner.start()``) until process exit, so the lock is an authoritative,
+    up-to-the-instant ownership token, not a ~1s-stale liveness observation.
+    ``is_gateway_runtime_lock_active`` is a side-effect-free non-blocking
+    try-acquire. Checked under ``cron/.tick.lock`` inside ``tick()``, and paired
+    with a ``.tick.lock`` drain barrier the gateway runs at startup, this makes
+    the desktop/gateway hand-off a claim rather than a race. Evaluated per tick,
+    so the desktop ticker resumes automatically when the gateway stops.
 
     Fails open (True): cron must never be left without a trigger because a
-    liveness probe errored.
+    probe errored.
     """
     try:
-        from gateway.status import get_running_pid_cached
+        from gateway.status import is_gateway_runtime_lock_active
 
-        return get_running_pid_cached() is None
+        return not is_gateway_runtime_lock_active()
     except Exception:
         return True
 

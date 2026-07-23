@@ -23004,6 +23004,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
 
+    # Let any in-flight standalone (desktop) cron tick finish committing its
+    # dispatch under cron/.tick.lock before this gateway's adapters go live, so
+    # the same cron occurrence is never delivered by both the desktop's degraded
+    # path and this gateway. gateway.lock is already held above, so a desktop
+    # tick that rechecks the owner gate from here on defers to us; this barrier
+    # closes the ordering for a tick that had already passed its recheck when we
+    # started (#66629).
+    try:
+        from cron.scheduler import drain_inflight_tick
+
+        drain_inflight_tick()
+    except Exception as exc:
+        logger.debug("drain_inflight_tick skipped: %s", exc)
+
     # Start the gateway
     success = await runner.start()
     if not success:

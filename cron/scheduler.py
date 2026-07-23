@@ -599,6 +599,50 @@ def _get_lock_paths() -> tuple[Path, Path]:
     return lock_dir, lock_dir / ".tick.lock"
 
 
+def drain_inflight_tick(timeout: float = 90.0) -> bool:
+    """Block until no other process holds ``cron/.tick.lock``, then release.
+
+    A bounded poll of the same non-blocking lock ``tick()`` holds across its
+    dispatch commit. The gateway calls this at startup, BEFORE its adapters go
+    live, so any in-flight standalone (desktop) tick finishes committing its
+    dispatch decision under the lock before the gateway becomes deliver-capable.
+    That turns the desktop/gateway hand-off into a provable lock ordering rather
+    than a timing assumption (#66629): a tick that already committed under the
+    lock was legitimately the owner at that instant, and the gateway's adapters
+    cannot come up until it releases, so the same cron occurrence is never
+    delivered by both processes.
+
+    Returns True once the lock was observed free (and immediately released), or
+    False on timeout, after which startup proceeds and falls back to the
+    per-tick ``is_gateway_runtime_lock_active`` gate. Never blocks forever.
+    """
+    lock_dir, lock_file = _get_lock_paths()
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout
+    while True:
+        lock_fd = None
+        try:
+            lock_fd = open(lock_file, "w", encoding="utf-8")
+            if fcntl:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            elif msvcrt:
+                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+            # Acquired: no tick is in flight. Closing the fd releases the lock.
+            lock_fd.close()
+            return True
+        except (OSError, IOError):
+            if lock_fd is not None:
+                lock_fd.close()
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "drain_inflight_tick: cron/.tick.lock still held after %.0fs; "
+                    "proceeding (the per-tick gateway-owner gate still applies)",
+                    timeout,
+                )
+                return False
+            time.sleep(0.05)
+
+
 def _resolve_origin(job: dict) -> Optional[dict]:
     """Extract origin info from a job, preserving any extra routing metadata.
 
