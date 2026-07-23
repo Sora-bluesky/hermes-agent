@@ -16,9 +16,15 @@ is set. We patch `cron.scheduler.tick` (both tickers import it locally as
 `cron_tick`, so the module-attribute patch is observed) and assert the loop
 drives it and stops promptly.
 """
+import builtins
+import errno
+import sys
 import threading
 import time
+from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 
 def _wait_until(predicate, timeout=10.0, interval=0.005):
@@ -701,23 +707,274 @@ class TestGuardJobCredentialExfil:
 # and resumes automatically when the gateway stops.
 
 
-def test_no_live_gateway_gate(monkeypatch):
-    """_no_live_gateway: False while a gateway PID is live, True when none,
-    True (fail open — cron must never lose its trigger) on probe errors."""
+@pytest.mark.parametrize("state, pid_live, expect_dispatch", [
+    ("free",   False, True),
+    ("held",   False, False),
+    ("unknown", True, False),
+    ("unknown", False, True),
+])
+def test_no_live_gateway_decision_table(monkeypatch, state, pid_live, expect_dispatch):
+    """_no_live_gateway drives its dispatch/defer verdict off the read-only
+    lock probe, falling back to owner-PID liveness only when the probe itself
+    is inconclusive ("unknown"). The PID-fallback record carries a start_time
+    matching the (mocked) live process, so a positive identity match is
+    actually confirmable -- an unconfirmable (start_time-less) record is its
+    own dedicated test (test_no_live_gateway_pid_fallback_rejects_unconfirmable_start_time)."""
     import gateway.status as status
     from hermes_cli.web_server import _no_live_gateway
 
-    monkeypatch.setattr(status, "get_running_pid_cached", lambda *a, **k: 4321)
-    assert _no_live_gateway() is False
+    monkeypatch.setattr(status, "probe_gateway_runtime_lock", lambda *a, **k: state)
+    monkeypatch.setattr(status, "_pid_exists", lambda pid: pid_live)
+    monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 555)
+    monkeypatch.setattr(
+        status, "_read_gateway_lock_record",
+        lambda *a, **k: {"pid": 4242, "start_time": 555} if pid_live else None,
+    )
+    monkeypatch.setattr(status, "_read_pid_record", lambda *a, **k: None)
+    monkeypatch.setattr(status, "_record_matches_live_gateway_pid", lambda *a, **k: True)
+    assert _no_live_gateway() is expect_dispatch
 
-    monkeypatch.setattr(status, "get_running_pid_cached", lambda *a, **k: None)
+
+def test_no_live_gateway_blind_fail_open(monkeypatch):
+    """When even the owner-present verdict itself raises (both signals
+    blind), the gate biases to cron liveness rather than stranding a
+    desktop-only user's cron forever."""
+    import gateway.status as status
+    from hermes_cli.web_server import _no_live_gateway
+
+    monkeypatch.setattr(status, "gateway_runtime_owner_present", lambda: (_ for _ in ()).throw(RuntimeError()))
     assert _no_live_gateway() is True
 
-    def _boom(*a, **k):
-        raise RuntimeError("probe failed")
 
-    monkeypatch.setattr(status, "get_running_pid_cached", _boom)
-    assert _no_live_gateway() is True
+def test_no_live_gateway_pid_fallback_rejects_foreign_home_pid(monkeypatch):
+    """Regression for PID reuse across HERMES_HOMEs: a live PID that reads as
+    *some* gateway is not enough — it must identify as THIS home's gateway.
+    expected_home must actually be threaded into
+    _record_matches_live_gateway_pid(), and a rejection there must dispatch
+    (not silently defer forever). start_time matches (confirmable) so this
+    exercises the identity check itself, not the separate start_time gate."""
+    import gateway.status as status
+    from hermes_cli.web_server import _no_live_gateway
+
+    seen_expected_homes = []
+
+    def _spy_matches(record, pid, *, expected_home=None):
+        seen_expected_homes.append(expected_home)
+        return False  # identifies as a DIFFERENT home's gateway
+
+    monkeypatch.setattr(status, "probe_gateway_runtime_lock", lambda *a, **k: "unknown")
+    monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+    monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 555)
+    monkeypatch.setattr(
+        status, "_read_gateway_lock_record",
+        lambda *a, **k: {"pid": 4242, "start_time": 555},
+    )
+    monkeypatch.setattr(status, "_read_pid_record", lambda *a, **k: None)
+    monkeypatch.setattr(status, "_record_matches_live_gateway_pid", _spy_matches)
+
+    assert _no_live_gateway() is True  # dispatch: the live PID is not OUR gateway
+    assert seen_expected_homes, "identity check was never invoked"
+    assert seen_expected_homes[0] is not None, \
+        "expected_home must be threaded into _record_matches_live_gateway_pid"
+
+
+def test_no_live_gateway_pid_fallback_rejects_start_time_mismatch(monkeypatch):
+    """A recycled PID whose recorded start_time no longer matches the live
+    process must be rejected by the PID-reuse guard BEFORE the identity check
+    even runs — mirroring get_running_pid()'s own guard."""
+    import gateway.status as status
+    from hermes_cli.web_server import _no_live_gateway
+
+    identity_calls = []
+
+    monkeypatch.setattr(status, "probe_gateway_runtime_lock", lambda *a, **k: "unknown")
+    monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+    monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 999)
+    monkeypatch.setattr(
+        status, "_read_gateway_lock_record",
+        lambda *a, **k: {"pid": 4242, "start_time": 111},
+    )
+    monkeypatch.setattr(status, "_read_pid_record", lambda *a, **k: None)
+    monkeypatch.setattr(
+        status, "_record_matches_live_gateway_pid",
+        lambda *a, **k: identity_calls.append(1) or True,
+    )
+
+    assert _no_live_gateway() is True  # dispatch: stale record, PID was reused
+    assert not identity_calls, \
+        "start_time mismatch must short-circuit before the identity check runs"
+
+
+def test_no_live_gateway_pid_fallback_rejects_unconfirmable_start_time(monkeypatch):
+    """Sol pass 4, Finding 1: a legacy lock record with NO start_time cannot be
+    positively confirmed as this home's gateway, even when the live PID's
+    cmdline looks like a bare (root/custom-HERMES_HOME) gateway process --
+    that cmdline shape is indistinguishable from a DIFFERENT home's bare
+    gateway (no --profile in argv to disambiguate). Trusting it risks a
+    recycled PID belonging to another home, which would report owner-present
+    forever and strand the desktop ticker. The gate must dispatch instead."""
+    import gateway.status as status
+    from hermes_cli.web_server import _no_live_gateway
+
+    monkeypatch.setattr(status, "probe_gateway_runtime_lock", lambda *a, **k: "unknown")
+    monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+    monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 12345)
+    monkeypatch.setattr(
+        status, "_read_gateway_lock_record",
+        lambda *a, **k: {"pid": 4242},  # legacy record: no "start_time" key
+    )
+    monkeypatch.setattr(status, "_read_pid_record", lambda *a, **k: None)
+    # Even if the identity check WOULD confirm a match (cmdline looks like a
+    # bare gateway for the right profile), the missing start_time must never
+    # let that positive result through.
+    monkeypatch.setattr(status, "_record_matches_live_gateway_pid", lambda *a, **k: True)
+
+    assert _no_live_gateway() is True  # dispatch: start_time unconfirmable, must not strand
+
+
+# ── probe_gateway_runtime_lock: read-only classifier ─────────────────────────
+# Unlike is_gateway_runtime_lock_active(), the probe never creates or unlinks
+# the lock file and never collapses a permanent lock error into "held"/"free"
+# — a genuinely unprobeable lock must surface as "unknown" so the caller can
+# fall back rather than mis-report ownership.
+
+
+def test_probe_gateway_runtime_lock_held_via_real_os_lock(tmp_path, monkeypatch):
+    """A second, independent handle holding the real OS lock is detected as
+    "held" by a fresh open()+non-blocking-lock-attempt — not via the
+    in-process _gateway_lock_handle fast path (deliberately cleared)."""
+    import gateway.status as status
+
+    lock_path = tmp_path / "gateway.lock"
+    monkeypatch.setattr(status, "_gateway_lock_handle", None)
+
+    holder = open(lock_path, "a+", encoding="utf-8")
+    try:
+        assert status._try_acquire_file_lock(holder) is True
+        assert status.probe_gateway_runtime_lock(lock_path) == "held"
+    finally:
+        status._release_file_lock(holder)
+        holder.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="msvcrt byte-range/EOF semantics are Windows-specific")
+def test_probe_gateway_runtime_lock_windows_held_while_empty(tmp_path, monkeypatch):
+    """Regression: acquire_gateway_runtime_lock() takes the byte-range lock
+    FIRST and only afterwards truncates + rewrites the JSON record
+    (_write_gateway_lock_record) — so there is a real window where the file
+    is 0 bytes while the lock is held. The probe must not use file size as a
+    free/held signal (msvcrt.locking() can lock a range past EOF)."""
+    import gateway.status as status
+
+    lock_path = tmp_path / "gateway.lock"
+    monkeypatch.setattr(status, "_gateway_lock_handle", None)
+
+    holder = open(lock_path, "a+", encoding="utf-8")
+    try:
+        assert status._try_acquire_file_lock(holder) is True
+        # Simulate the narrow post-acquire, pre-rewrite race window.
+        holder.seek(0)
+        holder.truncate()
+        holder.flush()
+        assert lock_path.stat().st_size == 0
+
+        assert status.probe_gateway_runtime_lock(lock_path) == "held"
+    finally:
+        status._release_file_lock(holder)
+        holder.close()
+
+
+def test_probe_gateway_runtime_lock_free_when_missing_or_unheld(tmp_path, monkeypatch):
+    import gateway.status as status
+
+    monkeypatch.setattr(status, "_gateway_lock_handle", None)
+
+    missing = tmp_path / "missing.lock"
+    assert status.probe_gateway_runtime_lock(missing) == "free"
+
+    existing = tmp_path / "gateway.lock"
+    existing.write_text('{"pid": 4242}', encoding="utf-8")
+    assert status.probe_gateway_runtime_lock(existing) == "free"
+
+
+def test_probe_gateway_runtime_lock_unknown_on_permanent_lock_error(tmp_path, monkeypatch):
+    """A non-contention OSError from the lock primitive (e.g. ENOLCK on an
+    NFS/unsupported filesystem) must classify as "unknown", never "free" —
+    contrast with genuine contention (including EACCES, which is a plain
+    PermissionError, NOT a BlockingIOError), which still classifies as
+    "held"."""
+    import gateway.status as status
+
+    lock_path = tmp_path / "gateway.lock"
+    lock_path.write_text('{"pid": 4242}', encoding="utf-8")
+    monkeypatch.setattr(status, "_gateway_lock_handle", None)
+
+    if status._IS_WINDOWS:
+        def _raise_enolck(fd, mode, size):
+            raise OSError(errno.ENOLCK, "no locks available")
+
+        monkeypatch.setattr(status.msvcrt, "locking", _raise_enolck)
+        assert status.probe_gateway_runtime_lock(lock_path) == "unknown"
+
+        def _raise_eacces(fd, mode, size):
+            raise OSError(errno.EACCES, "access denied")
+
+        monkeypatch.setattr(status.msvcrt, "locking", _raise_eacces)
+        assert status.probe_gateway_runtime_lock(lock_path) == "held"
+    else:
+        def _raise_enolck(fd, flags):
+            raise OSError(errno.ENOLCK, "no locks available")
+
+        monkeypatch.setattr(status.fcntl, "flock", _raise_enolck)
+        assert status.probe_gateway_runtime_lock(lock_path) == "unknown"
+
+        def _raise_blocking(fd, flags):
+            raise BlockingIOError(errno.EAGAIN, "would block")
+
+        monkeypatch.setattr(status.fcntl, "flock", _raise_blocking)
+        assert status.probe_gateway_runtime_lock(lock_path) == "held"
+
+        def _raise_eacces(fd, flags):
+            raise OSError(errno.EACCES, "access denied")  # PermissionError, NOT BlockingIOError
+
+        monkeypatch.setattr(status.fcntl, "flock", _raise_eacces)
+        assert status.probe_gateway_runtime_lock(lock_path) == "held"
+
+
+def test_probe_gateway_runtime_lock_unknown_on_open_error_never_unlinks(tmp_path, monkeypatch):
+    """When the lock path can't even be opened (permission error), the probe
+    reports "unknown" and — critically — never unlinks it (unlike
+    is_gateway_runtime_lock_active()'s stale-root-owned-lock cleanup on the
+    same PermissionError), and opens without O_CREAT (mode "r+", not "a+")."""
+    import gateway.status as status
+
+    lock_path = tmp_path / "gateway.lock"
+    lock_path.write_text('{"pid": 4242}', encoding="utf-8")
+    monkeypatch.setattr(status, "_gateway_lock_handle", None)
+
+    real_open = builtins.open
+    opened_modes = []
+
+    def _spy_open(path, mode="r", *args, **kwargs):
+        if Path(path) == lock_path:
+            opened_modes.append(mode)
+            raise PermissionError(errno.EACCES, "access denied")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(status, "open", _spy_open, raising=False)
+
+    unlink_calls = []
+    original_unlink = Path.unlink
+
+    def _spy_unlink(self, *args, **kwargs):
+        unlink_calls.append(self)
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", _spy_unlink)
+
+    assert status.probe_gateway_runtime_lock(lock_path) == "unknown"
+    assert unlink_calls == [], "probe must never unlink the lock path"
+    assert opened_modes == ["r+"], "probe must open without O_CREAT (mode r+, not a+)"
 
 
 def test_desktop_ticker_defers_while_gateway_running(monkeypatch):
@@ -726,9 +983,9 @@ def test_desktop_ticker_defers_while_gateway_running(monkeypatch):
     import gateway.status as status
     from hermes_cli.web_server import _start_desktop_cron_ticker
 
-    gateway_pid = {"pid": 4321}
+    gateway_owned = {"present": True}
     monkeypatch.setattr(
-        status, "get_running_pid_cached", lambda *a, **k: gateway_pid["pid"]
+        status, "gateway_runtime_owner_present", lambda: gateway_owned["present"]
     )
 
     calls = []
@@ -744,7 +1001,7 @@ def test_desktop_ticker_defers_while_gateway_running(monkeypatch):
         t.start()
         time.sleep(0.05)
         assert calls == [], "desktop ticker ticked while a gateway was running"
-        gateway_pid["pid"] = None  # gateway stopped
+        gateway_owned["present"] = False  # gateway stopped
         assert _wait_until(lambda: len(calls) >= 1), \
             "desktop ticker did not resume after the gateway stopped"
         stop.set()

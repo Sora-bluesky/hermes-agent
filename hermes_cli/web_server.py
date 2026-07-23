@@ -147,21 +147,25 @@ _log = logging.getLogger(__name__)
 def _no_live_gateway() -> bool:
     """Dispatch gate for the desktop cron ticker (#66629).
 
-    Returns False while a live gateway owns this HERMES_HOME. The gateway's
-    ticker delivers through live platform adapters (interactive cards, rich
-    messages); the desktop ticker's standalone path silently degrades those to
-    plain text — so while a gateway is up, the desktop ticker must defer every
-    tick to it instead of racing it for ``cron/.tick.lock``. Evaluated per
-    tick, so the desktop ticker resumes automatically when the gateway stops.
-
-    Fails open (True): cron must never be left without a trigger because a
-    liveness probe errored.
+    Returns False while a gateway owns this HERMES_HOME so its live adapters
+    deliver cron occurrences richly; the desktop standalone path degrades them
+    to plain text. Uses a read-only probe of the gateway runtime lock (never
+    unlinks it); when the lock cannot be probed, falls back to a read-only
+    liveness check on the recorded owner PID, so a permanent probe error cannot
+    strand a desktop-only user's cron. Evaluated per tick, before the mutating
+    get_due_jobs, so ticking resumes on its own when the gateway stops.
     """
     try:
-        from gateway.status import get_running_pid_cached
-
-        return get_running_pid_cached() is None
+        from gateway.status import gateway_runtime_owner_present
+        return not gateway_runtime_owner_present()
     except Exception:
+        # Truly blind (both signals raised). Bias to cron liveness: the due
+        # occurrences of an affected tick are delivered degraded if a gateway
+        # is concurrently up, and a persistent probe error affects later ticks
+        # too; .tick.lock + get_due_jobs/advance_next_run still prevent double
+        # delivery for valid persisted recurring jobs (a malformed schedule
+        # that advance_next_run() can't advance is a separate, pre-existing
+        # gap in cron/jobs.py, not something this gate controls).
         return True
 
 

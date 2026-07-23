@@ -11,6 +11,7 @@ that will be useful when we add named profiles (multiple agents running
 concurrently under distinct configurations).
 """
 
+import errno
 import hashlib
 import json
 import logging
@@ -46,6 +47,21 @@ _WINDOWS_LOCK_OFFSET = 1024 * 1024
 _GATEWAY_RUNNING_PID_CACHE_TTL_SECONDS = 1.0
 _gateway_running_pid_cache_lock = threading.Lock()
 _gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple[Any, ...], Optional[int]]] = {}
+_WIN_CONTENTION = frozenset(
+    e for e in (getattr(errno, "EACCES", 13),
+                getattr(errno, "EDEADLOCK", 36),
+                getattr(errno, "EDEADLK", 35)) if e is not None
+)
+# POSIX flock(LOCK_NB) nonblocking-contention errnos. EAGAIN/EWOULDBLOCK
+# surface as BlockingIOError; EACCES is also a documented contention errno on
+# some platforms/filesystems and surfaces as a plain PermissionError (an
+# OSError subclass, NOT a BlockingIOError subclass) -- classify by errno so
+# that case is not misread as an unprobeable lock.
+_POSIX_LOCK_CONTENTION = frozenset(
+    e for e in (getattr(errno, "EAGAIN", 11),
+                getattr(errno, "EACCES", 13),
+                getattr(errno, "EWOULDBLOCK", 11)) if e is not None
+)
 
 logger = logging.getLogger(__name__)
 
@@ -944,6 +960,149 @@ def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
             handle.close()
         except OSError:
             pass
+
+
+def probe_gateway_runtime_lock(lock_path: Optional[Path] = None) -> str:
+    """Read-only classification of the gateway runtime lock.
+
+    Returns "held" (a live process contends the lock), "free" (no owner), or
+    "unknown" (permission or unsupported-FS lock error). Unlike
+    is_gateway_runtime_lock_active(): NEVER creates or unlinks the lock file
+    and NEVER reports a permanent lock error as "held"/"free".
+    """
+    global _gateway_lock_handle
+    resolved = lock_path or _get_gateway_lock_path()
+
+    if _gateway_lock_handle is not None and resolved == _get_gateway_lock_path():
+        return "held"
+
+    try:
+        if not resolved.exists():
+            return "free"
+    except OSError:
+        # Path.exists() only swallows ENOENT/ENOTDIR/EBADF/ELOOP-class errors
+        # and re-raises everything else (see pathlib._ignore_error) -- so an
+        # OSError here is a genuine "can't tell", never a disguised EACCES.
+        # (Python 3.14 changes exists() to swallow ALL OSErrors and return
+        # False instead -- this except branch would go dead there. pyproject
+        # pins requires-python <3.14, so it's moot today.)
+        return "unknown"
+
+    try:
+        # "r+", never "a+": O_CREAT would make this "read-only" probe create
+        # the lock file when it races a concurrent cleanup. A file that
+        # vanished between exists() and open() has no owner -- "free", not a
+        # probe failure. The handle is never written to.
+        handle = open(resolved, "r+", encoding="utf-8")
+    except FileNotFoundError:
+        return "free"
+    except OSError:
+        return "unknown"
+
+    try:
+        if _IS_WINDOWS:
+            # Do NOT gate on current file size. acquire_gateway_runtime_lock()
+            # takes the byte-range lock FIRST and only afterwards truncates +
+            # rewrites the JSON record (_write_gateway_lock_record), so there
+            # is a real window where the file is 0 bytes while the lock is
+            # held. msvcrt.locking() can lock a range past EOF, so the lock
+            # attempt itself -- not file size -- is the only valid signal.
+            handle.seek(_WINDOWS_LOCK_OFFSET)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                if isinstance(exc, PermissionError) or exc.errno in _WIN_CONTENTION:
+                    return "held"
+                return "unknown"
+            handle.seek(_WINDOWS_LOCK_OFFSET)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return "free"
+        else:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                # flock()'s nonblocking-contention errno is platform/FS
+                # dependent -- EAGAIN/EWOULDBLOCK surface as BlockingIOError,
+                # but EACCES (a plain PermissionError, NOT a BlockingIOError
+                # subclass) is also a documented contention errno on some
+                # platforms. Classify by errno, not exception type alone --
+                # but keep the isinstance(BlockingIOError) check too, since a
+                # bare BlockingIOError() (errno unset on some raise sites)
+                # must still read as contention rather than "unknown".
+                if isinstance(exc, BlockingIOError) or exc.errno in _POSIX_LOCK_CONTENTION:
+                    return "held"
+                return "unknown"
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return "free"
+    except OSError:
+        return "unknown"
+    finally:
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
+def gateway_runtime_owner_present() -> bool:
+    """Best-effort read-only verdict for the desktop cron gate.
+
+    True  -> a gateway owns this HERMES_HOME (defer).
+    False -> none does, or the lock is unprobeable AND no live owner PID can
+             be POSITIVELY CONFIRMED (dispatch — never stalls a desktop-only
+             user's cron on a match it cannot actually verify).
+    Never creates, unlinks, or otherwise mutates shared state.
+    """
+    state = probe_gateway_runtime_lock()
+    if state == "held":
+        return True
+    if state == "free":
+        return False
+    # state == "unknown": authoritative lock signal unavailable. Fall back to
+    # a read-only liveness+identity check on the recorded owner PID.
+    #
+    # Based on get_running_pid()'s own identity check (recorded/current
+    # start_time PID-reuse guard, then _record_matches_live_gateway_pid(...))
+    # -- inlined rather than calling get_running_pid() itself, because that
+    # function routes through is_gateway_runtime_lock_active() (which unlinks
+    # a stale/root-owned lock) and _cleanup_invalid_pid_path() (which unlinks
+    # the PID file). Calling it here would defeat the entire point of a
+    # read-only probe.
+    #
+    # Deliberately STRICTER than get_running_pid(): this loop also passes
+    # expected_home=... (get_running_pid() does not) and additionally
+    # requires start_time to be present on BOTH sides -- not merely absent of
+    # a confirmed mismatch. get_running_pid() falls through to the identity
+    # check when start_time can't be compared; here that is not enough,
+    # because a false "owner present" strands the desktop ticker deferring
+    # forever rather than merely being wrong about a status display.
+    expected_home = _get_process_hermes_home()
+    for record in (_read_gateway_lock_record(_get_gateway_lock_path()),
+                   _read_pid_record()):
+        pid = _pid_from_record(record)
+        if pid is None or not _pid_exists(pid):
+            continue
+        recorded_start = record.get("start_time")
+        current_start = _get_process_start_time(pid)
+        # Require a USABLE start_time on both sides to positively confirm
+        # ownership, not merely to reject a known mismatch. A bare
+        # ``hermes gateway`` (root/custom HERMES_HOME, no --profile in argv)
+        # is indistinguishable by cmdline alone from a DIFFERENT home's bare
+        # gateway -- looks_like_gateway_runtime_command_line() only checks
+        # that it looks like *a* gateway, and _command_line_belongs_to_profile
+        # only disambiguates named profiles. A legacy record with no
+        # start_time (or a live process whose start_time can't be read) gives
+        # us no way to rule out a recycled PID reused by that other home's
+        # gateway. Rather than risk a false "owner present" that strands the
+        # desktop ticker deferring forever, treat an unconfirmable start_time
+        # as owner-NOT-present here -- consistent with this whole fallback's
+        # "unknown -> dispatch unless positively confirmed" design.
+        if recorded_start is None or current_start is None:
+            continue
+        if current_start != recorded_start:
+            continue
+        if _record_matches_live_gateway_pid(record, pid, expected_home=expected_home):
+            return True
+    return False
 
 
 def write_pid_file() -> None:
