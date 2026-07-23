@@ -1673,6 +1673,76 @@ class TestQuickSnapshot:
         # The prior complete snapshot survives the incomplete run.
         assert prior.is_dir()
 
+    def test_all_size_skipped_snapshot_persists_manifest_and_keeps_prior(
+        self, tmp_path
+    ):
+        """When EVERY present protected file is skipped for size, `manifest`
+        and `failed` both stay empty -- only `size_skipped` is populated. The
+        snapshot must still persist a manifest recording size_skipped and must
+        NOT be deleted, and a prior complete snapshot must survive.
+
+        Reproduces egilewski's report on #68907: an 8 KiB state.db as the only
+        present protected file with a 4 KiB cap left no durable size_skipped
+        record, because `if not manifest and not failed:` fired and deleted
+        snap_dir before the manifest (and its size_skipped entries) could ever
+        be written -- losing the forensic "these files existed but were
+        skipped for size" record."""
+        from hermes_cli.backup import create_quick_snapshot
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        # Only protected file present, and it is over the cap -- the
+        # all-size-skipped path (manifest={}, failed={}, size_skipped={...}).
+        (home / "state.db").write_bytes(b"x" * 8192)
+
+        prior = home / "state-snapshots" / "20200101-000000"
+        prior.mkdir(parents=True)
+        (prior / "manifest.json").write_text('{"id": "20200101-000000", "files": {}}')
+
+        snap_id = create_quick_snapshot(hermes_home=home, max_file_size=4096, keep=1)
+
+        assert snap_id is not None, (
+            "an all-size-skipped snapshot must not return None -- it has a "
+            "durable size_skipped record to persist"
+        )
+        snap_dir = home / "state-snapshots" / snap_id
+        assert snap_dir.is_dir(), "snapshot dir must not be deleted"
+        manifest_path = snap_dir / "manifest.json"
+        assert manifest_path.exists(), (
+            "manifest must persist even though manifest/failed are both empty"
+        )
+        with open(manifest_path) as f:
+            meta = json.load(f)
+        assert meta.get("files") == {}
+        assert "state.db" in meta.get("size_skipped", {})
+        # The prior complete snapshot must not be evicted by this incomplete run.
+        assert prior.is_dir(), "prior complete snapshot was pruned by an incomplete run"
+
+    def test_unsafe_label_is_dropped_not_used_as_a_path_component(
+        self, hermes_home
+    ):
+        """A label containing a path separator or a traversal segment must
+        not be embedded into snap_dir -- it is dropped (falling back to the
+        plain timestamp id) rather than escaping state-snapshots/ or aborting
+        the protective snapshot (Sol xhigh review, #68907). Uses enough ".."
+        segments that an unguarded label would genuinely resolve outside
+        state-snapshots/, and covers both separator styles."""
+        from hermes_cli.backup import create_quick_snapshot
+
+        root = hermes_home / "state-snapshots"
+        for bad_label in ("../../../evil", "..\\..\\..\\evil"):
+            snap_id = create_quick_snapshot(label=bad_label, hermes_home=hermes_home)
+            assert snap_id is not None
+            assert "/" not in snap_id and "\\" not in snap_id
+            snap_dir = root / snap_id
+            # Resolved snapshot dir must stay inside state-snapshots/.
+            snap_dir.resolve().relative_to(root.resolve())
+            assert snap_dir.is_dir()
+            # The label is dropped outright, not merely sanitized in place.
+            with open(snap_dir / "manifest.json") as f:
+                meta = json.load(f)
+            assert meta["label"] is None
+
     def test_failed_capture_never_prunes_any_snapshot(self, hermes_home):
         """A HARD capture failure blocks pruning entirely: an older snapshot may
         be the only copy of the file this run failed on, so nothing is evicted
