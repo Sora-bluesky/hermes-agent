@@ -331,6 +331,87 @@ class TestIdempotence:
         assert rewrite(once) == once
 
 
+class TestBacktickSubstitutionUntouched:
+    """Legacy backtick command substitution (`` `cmd` ``) can itself contain
+    `&&`, `||`, or a bare `&`. The scanner has no way to find the matching
+    closing backtick without reproducing backtick's own quoting/escaping
+    rules (distinct from double-quote parsing), so treating those operators
+    as top-level corrupted valid bash into invalid bash: `echo `A && B` &`
+    (bash -n: valid) rewrote to `echo `A && { B` & }` (bash -n: syntax
+    error, unmatched backtick) -- a validity inversion through the
+    backtick-substitution scanner scope (#68948 review, egilewski). Same
+    fix shape as the parenthesised-subshell non-goal: when we can't safely
+    tokenize it, leave the command alone rather than risk corrupting it.
+    """
+
+    def test_and_and_inside_backtick_substitution_untouched(self):
+        cmd = "echo `A && B` &"
+        assert rewrite(cmd) == cmd
+
+    def test_or_inside_backtick_substitution_untouched(self):
+        cmd = "echo `A || B` &"
+        assert rewrite(cmd) == cmd
+
+    def test_bare_ampersand_inside_backtick_substitution_untouched(self):
+        cmd = "echo `A & B` &"
+        assert rewrite(cmd) == cmd
+
+    def test_backtick_reachable_from_a_chain_operator_untouched(self):
+        # No operator inside the backtick itself, but the bail is
+        # whole-command conservative: losing this rewrite opportunity is
+        # the accepted cost of never risking corruption of the backtick
+        # region elsewhere in the same scan.
+        cmd = "A && `date` &"
+        assert rewrite(cmd) == cmd
+
+    def test_multiline_backtick_bails_the_whole_command(self):
+        # Even a rewrite candidate on an earlier, backtick-free line is
+        # dropped once any unquoted backtick appears anywhere in the
+        # command -- conservative by design (see class docstring).
+        cmd = "X && Y &\nA && `date` &"
+        assert rewrite(cmd) == cmd
+
+    def test_escaped_backtick_not_mistaken_for_substitution(self):
+        # \` is a literal backtick character, not a substitution boundary
+        # (already handled by the existing backslash-escape branch), so
+        # the compound is still safely rewritable.
+        cmd = r"echo \`literal\` && B &"
+        assert rewrite(cmd) == r"echo \`literal\` && { B & }"
+
+    def test_backtick_inside_single_quotes_not_mistaken(self):
+        cmd = "echo 'A `x` B' && C &"
+        assert rewrite(cmd) == "echo 'A `x` B' && { C & }"
+
+    def test_backtick_inside_double_quotes_not_mistaken(self):
+        cmd = 'echo "A `x` B" && C &'
+        assert rewrite(cmd) == 'echo "A `x` B" && { C & }'
+
+    def test_backtick_compound_stays_valid_bash(self):
+        # C1: executable check (bash -n), not just a string comparison --
+        # prove the rewriter output is valid wherever the original was.
+        shutil = pytest.importorskip("shutil")
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available")
+        for cmd in (
+            "echo `A && B` &",
+            "echo `A || B` &",
+            "echo `A & B` &",
+            "A && `date` &",
+        ):
+            orig = subprocess.run(
+                ["bash", "-n", "-c", cmd], capture_output=True, text=True
+            )
+            assert orig.returncode == 0, f"expected {cmd!r} to be valid bash"
+            rewritten = rewrite(cmd)
+            out = subprocess.run(
+                ["bash", "-n", "-c", rewritten], capture_output=True, text=True
+            )
+            assert out.returncode == 0, (
+                f"rewriter turned valid {cmd!r} into invalid {rewritten!r}: "
+                f"{out.stderr}"
+            )
+
+
 class TestEdgeCases:
     def test_only_chain_op_no_second_command(self):
         # Malformed input: bash would error, we shouldn't crash or rewrite.

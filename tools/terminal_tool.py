@@ -762,6 +762,22 @@ def _rewrite_compound_background(command: str) -> str:
     a leaked subshell stuck in ``wait4`` — a real but much smaller
     problem than a silent semantic corruption, so it's accepted rather
     than chased with more textual rewriting.
+
+    A second, narrower non-goal in the same family: a legacy backtick
+    command substitution (`` `cmd` ``) at depth 0 can itself contain `&&`,
+    `||`, or `&`. Unlike double quotes, this scanner has no way to safely
+    locate the *matching* closing backtick — backtick substitution has its
+    own quoting/escaping rules, and a naive "next literal backtick" scan
+    can be fooled by nested quoting inside the substitution. Rather than
+    risk misreading the substitution's contents as top-level operators
+    (which previously corrupted valid bash into invalid bash, e.g.
+    `` echo `A && B` & `` → `` echo `A && { B` & } ``, an unmatched-backtick
+    syntax error — #68948 review), the rewriter bails out and returns the
+    *whole* command unchanged the moment an unquoted, unescaped backtick
+    appears at depth 0. That's more conservative than the parenthesised
+    case (which only skips content inside the parens, not the whole
+    command) because there is no reliable way to know where the backtick
+    substitution ends.
     """
     n = len(command)
     i = 0
@@ -838,6 +854,26 @@ def _rewrite_compound_background(command: str) -> str:
         if paren_depth > 0 or brace_depth > 0:
             i += 1
             continue
+
+        # Legacy backtick command substitution (`` `cmd` ``) can itself
+        # contain `&&`, `||`, or `&`, and has its own quoting/escaping rules
+        # (POSIX 2.6.3) distinct from the double-quote handling above --
+        # this character-at-a-time scanner cannot safely reproduce them to
+        # find the matching closing backtick. Treating operators inside it
+        # as top-level corrupts valid bash into invalid bash: `` echo `A &&
+        # B` & `` (bash -n: valid) rewrote to `` echo `A && { B` & } ``
+        # (bash -n: syntax error, unmatched backtick) -- a validity
+        # inversion through the backtick-substitution scanner scope
+        # (#68948 review). Same shape as the parenthesised-subshell
+        # non-goal above: rather than textually hunt for the matching
+        # backtick, bail out of rewriting the *whole* command the instant
+        # an unquoted, unescaped backtick appears at depth 0. This drops
+        # some otherwise-safe rewrite opportunities elsewhere in the same
+        # command (conservative by design), but it is the only way to
+        # guarantee the backtick's contents are never misread as top-level
+        # operators.
+        if ch == "`":
+            return command
 
         # Chain operators at depth 0
         if command.startswith("&&", i) or command.startswith("||", i):
