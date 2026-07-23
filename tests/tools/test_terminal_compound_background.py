@@ -412,6 +412,89 @@ class TestBacktickSubstitutionUntouched:
             )
 
 
+class TestUnscannableDepth0ConstructsBailWhole:
+    """Sol xhigh review (#68948, second pass) found the depth-0 backtick
+    guard above still had three bypasses -- all the same corruption class,
+    just reached through a different scanner gap:
+
+    1. A backtick EMBEDDED mid-word (not at token start) is swallowed by
+       ``_read_shell_token``'s generic token read before the main scan
+       loop ever visits it character-by-character, so the old inline
+       ``if ch == "`": return command`` branch never fired for it.
+    2. `${...}` parameter expansion: `{` right after `$` doesn't satisfy
+       the brace-*group* branch's "must be followed by whitespace" check,
+       so its contents (which may contain `&&`/`||`/`&` as literal default-
+       value text) pass through completely unguarded.
+    3. `[[ ... ]]` conditionals: `&&`/`||` inside `[[ ]]` are the
+       construct's own logical-test operators, not command-list
+       separators, but the scanner has no notion of `[[` as a reserved
+       word and reads them as top-level chain operators anyway.
+
+    Fix: ``_has_unscannable_depth0_construct`` pre-scans the whole command
+    (quote/escape-aware, not depth-aware) and bails before the main loop
+    starts if it finds any of the three, unquoted, anywhere -- not just at
+    a token boundary.
+    """
+
+    def test_embedded_backtick_mid_word_untouched(self):
+        # The bypass case: backtick is NOT the first character of its
+        # token (`_read_shell_token` swallows "pre`A" as one token before
+        # the main loop's per-character scan ever sees the `` ` ``).
+        cmd = "echo pre`A && B`post &"
+        assert rewrite(cmd) == cmd
+
+    def test_parameter_expansion_default_value_untouched(self):
+        cmd = "${x:-A&&B} &"
+        assert rewrite(cmd) == cmd
+
+    def test_conditional_expression_untouched(self):
+        cmd = "[[ -n x && -n y ]] &"
+        assert rewrite(cmd) == cmd
+
+    def test_three_counterexamples_stay_valid_bash(self):
+        # C1: executable check (bash -n) for all three of Sol's
+        # counterexamples -- must stay rc=0 after rewriting, exactly as
+        # they were before.
+        shutil = pytest.importorskip("shutil")
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available")
+        for cmd in (
+            "echo pre`A && B`post &",
+            "${x:-A&&B} &",
+            "[[ -n x && -n y ]] &",
+        ):
+            orig = subprocess.run(
+                ["bash", "-n", "-c", cmd], capture_output=True, text=True
+            )
+            assert orig.returncode == 0, (
+                f"expected {cmd!r} to be valid bash, got rc={orig.returncode}: "
+                f"{orig.stderr}"
+            )
+            rewritten = rewrite(cmd)
+            out = subprocess.run(
+                ["bash", "-n", "-c", rewritten], capture_output=True, text=True
+            )
+            assert out.returncode == 0, (
+                f"rewriter turned valid {cmd!r} into invalid {rewritten!r} "
+                f"(rc={out.returncode}): {out.stderr}"
+            )
+
+    def test_parameter_expansion_inside_double_quotes_still_rewritable(self):
+        # `${...}` inside double quotes is already opaque to the main
+        # scanner via the existing quote-handling branch -- the pre-scan's
+        # own quote tracking must agree, not double-bail.
+        cmd = 'echo "${x:-A&&B}" && C &'
+        assert rewrite(cmd) == 'echo "${x:-A&&B}" && { C & }'
+
+    def test_conditional_bracket_inside_single_quotes_still_rewritable(self):
+        cmd = "echo '[[ literal ]]' && C &"
+        assert rewrite(cmd) == "echo '[[ literal ]]' && { C & }"
+
+    def test_backtick_embedded_mid_word_inside_double_quotes_still_rewritable(self):
+        cmd = 'echo "pre`x`post" && C &'
+        assert rewrite(cmd) == 'echo "pre`x`post" && { C & }'
+
+
 class TestEdgeCases:
     def test_only_chain_op_no_second_command(self):
         # Malformed input: bash would error, we shouldn't crash or rewrite.

@@ -703,6 +703,72 @@ def _sudo_nopasswd_works() -> bool:
         return False
 
 
+def _has_unscannable_depth0_construct(command: str) -> bool:
+    """Return True when *command* contains, outside quotes and unescaped,
+    a construct whose own internal `&&`/`||`/`&` this character-at-a-time
+    scanner cannot distinguish from a top-level chain/background operator:
+
+    - a legacy backtick command substitution (`` `cmd` ``) -- has its own
+      POSIX quoting/escaping rules this scanner doesn't reproduce;
+    - a `${...}` parameter expansion -- `{` right after `$` is not the
+      brace-*group* `{ ` the main scan tracks (that one requires a space),
+      so unlike `(...)`/`{ ...; }` its contents pass through unguarded;
+    - a `[[ ... ]]` conditional -- its `&&`/`||` are the construct's own
+      logical operators, not command-list separators.
+
+    Deliberately quote-aware only, not paren/brace-depth-aware: a single,
+    easy-to-verify pass that only ever adds bailouts, never narrows them.
+    Over-bailing (skipping an otherwise-safe rewrite) is the accepted
+    cost -- it must never let the scan below mistake one of these
+    constructs' internals for real operators (#68948 review: `` echo
+    `A && B` & `` rewrote to the unmatched-backtick syntax error `` echo
+    `A && { B` & } ``; a backtick embedded mid-word, `${x:-A&&B}`, and
+    `[[ -n x && -n y ]]` all reproduce the same corruption).
+    """
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+
+        if ch == "'":
+            i += 1
+            while i < n and command[i] != "'":
+                i += 1
+            if i < n:
+                i += 1
+            continue
+
+        if ch == '"':
+            i += 1
+            while i < n:
+                inner = command[i]
+                if inner == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if inner == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+
+        if ch == "`":
+            return True
+
+        if ch == "$" and i + 1 < n and command[i + 1] == "{":
+            return True
+
+        if command.startswith("[[", i):
+            return True
+
+        i += 1
+
+    return False
+
+
 def _rewrite_compound_background(command: str) -> str:
     """Wrap `A && B &` (or `A || B &`) to `A && { B & }` at depth 0.
 
@@ -763,22 +829,25 @@ def _rewrite_compound_background(command: str) -> str:
     problem than a silent semantic corruption, so it's accepted rather
     than chased with more textual rewriting.
 
-    A second, narrower non-goal in the same family: a legacy backtick
-    command substitution (`` `cmd` ``) at depth 0 can itself contain `&&`,
-    `||`, or `&`. Unlike double quotes, this scanner has no way to safely
-    locate the *matching* closing backtick — backtick substitution has its
-    own quoting/escaping rules, and a naive "next literal backtick" scan
-    can be fooled by nested quoting inside the substitution. Rather than
-    risk misreading the substitution's contents as top-level operators
-    (which previously corrupted valid bash into invalid bash, e.g.
-    `` echo `A && B` & `` → `` echo `A && { B` & } ``, an unmatched-backtick
-    syntax error — #68948 review), the rewriter bails out and returns the
-    *whole* command unchanged the moment an unquoted, unescaped backtick
-    appears at depth 0. That's more conservative than the parenthesised
+    A second, narrower non-goal in the same family: legacy backtick
+    substitution (`` `cmd` ``), `${...}` parameter expansion, and `[[ ... ]]`
+    conditionals can all contain `&&`, `||`, or `&` of their own, with
+    parsing rules this scanner doesn't reproduce (see
+    ``_has_unscannable_depth0_construct``). Misreading their contents as
+    top-level operators previously corrupted valid bash into invalid bash
+    (`` echo `A && B` & `` → `` echo `A && { B` & } ``, an unmatched-backtick
+    syntax error — #68948 review; also reproduced with a backtick embedded
+    mid-word, `${x:-A&&B} &`, and `[[ -n x && -n y ]] &`). Rather than
+    textually track each construct's own matching delimiter, a pre-scan
+    bails out and returns the *whole* command unchanged the moment any of
+    them appears unquoted. That's more conservative than the parenthesised
     case (which only skips content inside the parens, not the whole
-    command) because there is no reliable way to know where the backtick
-    substitution ends.
+    command) because there is no reliable way to know where these
+    constructs end without reproducing their own grammar.
     """
+    if _has_unscannable_depth0_construct(command):
+        return command
+
     n = len(command)
     i = 0
     paren_depth = 0
@@ -854,26 +923,6 @@ def _rewrite_compound_background(command: str) -> str:
         if paren_depth > 0 or brace_depth > 0:
             i += 1
             continue
-
-        # Legacy backtick command substitution (`` `cmd` ``) can itself
-        # contain `&&`, `||`, or `&`, and has its own quoting/escaping rules
-        # (POSIX 2.6.3) distinct from the double-quote handling above --
-        # this character-at-a-time scanner cannot safely reproduce them to
-        # find the matching closing backtick. Treating operators inside it
-        # as top-level corrupts valid bash into invalid bash: `` echo `A &&
-        # B` & `` (bash -n: valid) rewrote to `` echo `A && { B` & } ``
-        # (bash -n: syntax error, unmatched backtick) -- a validity
-        # inversion through the backtick-substitution scanner scope
-        # (#68948 review). Same shape as the parenthesised-subshell
-        # non-goal above: rather than textually hunt for the matching
-        # backtick, bail out of rewriting the *whole* command the instant
-        # an unquoted, unescaped backtick appears at depth 0. This drops
-        # some otherwise-safe rewrite opportunities elsewhere in the same
-        # command (conservative by design), but it is the only way to
-        # guarantee the backtick's contents are never misread as top-level
-        # operators.
-        if ch == "`":
-            return command
 
         # Chain operators at depth 0
         if command.startswith("&&", i) or command.startswith("||", i):
