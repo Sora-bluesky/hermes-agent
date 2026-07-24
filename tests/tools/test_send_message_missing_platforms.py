@@ -77,19 +77,32 @@ def _make_aiohttp_resp(status, json_data=None, text_data=None):
 
 
 def _make_aiohttp_session(resp):
-    """Wrap a response mock in a session mock that supports async-with for post/put."""
+    """Wrap a response mock in a session mock that supports async-with for
+    post/put, AND works when the caller adopts the session directly
+    without ``async with`` (homeassistant's ``_standalone_send`` does this
+    since #67470's bounded-abandon close mechanism -- it adopts the
+    session with try/finally instead of `async with
+    aiohttp.ClientSession() as session:`, closing it explicitly via
+    ``.close()`` so the close is bounded/tracked instead of relying on an
+    unbounded implicit ``__aexit__``).
+
+    Real ``aiohttp.ClientSession.__aenter__()`` just returns ``self``, so
+    ``session_ctx`` IS ``session`` here to match: whichever way the code
+    under test obtains its session object (through ``async with`` or by
+    using the constructor's return value directly), it sees the same
+    mock with ``.post``/``.put``/``.close`` configured.
+    """
     request_ctx = MagicMock()
     request_ctx.__aenter__ = AsyncMock(return_value=resp)
     request_ctx.__aexit__ = AsyncMock(return_value=False)
 
-    session = MagicMock()
-    session.post = MagicMock(return_value=request_ctx)
-    session.put = MagicMock(return_value=request_ctx)
-
     session_ctx = MagicMock()
-    session_ctx.__aenter__ = AsyncMock(return_value=session)
+    session_ctx.post = MagicMock(return_value=request_ctx)
+    session_ctx.put = MagicMock(return_value=request_ctx)
+    session_ctx.close = AsyncMock()
+    session_ctx.__aenter__ = AsyncMock(return_value=session_ctx)
     session_ctx.__aexit__ = AsyncMock(return_value=False)
-    return session_ctx, session
+    return session_ctx, session_ctx
 
 
 # ---------------------------------------------------------------------------

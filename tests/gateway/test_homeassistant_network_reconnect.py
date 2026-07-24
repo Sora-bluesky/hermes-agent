@@ -13,7 +13,10 @@ transient network failures:
 """
 
 import asyncio
+import gc
 import time
+import weakref
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -791,3 +794,633 @@ async def test_disconnect_closes_rest_session_when_cancelled_during_ws_close():
     await _await_tracked_teardown(tracked)
     assert rest_close_completed.is_set(), "the REST session close must have completed"
     assert adapter._rest_session is None
+
+
+# ---------------------------------------------------------------------------
+# Bounded-abandon teardown mechanism (#67470, Sol xhigh exhaustive mechanism
+# review): an exhaustive close-site/failure-mode/state-machine enumeration
+# concluded the previously-fixed `wait_for` cancellation-suppression bug
+# (egilewski) was one member of a larger class. These regressions cover the
+# rest of that class: `_bounded_close` must ABANDON a close after
+# `_DRAIN_TIMEOUT` instead of waiting for its cancellation to actually
+# finish; a close() that raises CancelledError on its own must not abort
+# the surrounding cleanup sequence; the two ad-hoc ClientSession sites in
+# send()/_standalone_send() (S5/S6) must be bounded and closed even under
+# cancellation instead of relying on an unbounded implicit __aexit__; and a
+# cold connect() superseded by disconnect() must not publish/leak sessions.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bounded_close_abandons_cancellation_suppressing_close(monkeypatch):
+    """A close() that catches its own cancellation and keeps polling a stop
+    signal (rather than actually finishing) must not be AWAITED to
+    completion by _bounded_close.
+
+    Pre-fix, `asyncio.wait_for(closeable.close(), timeout=_DRAIN_TIMEOUT)`
+    cancels close() on timeout and then WAITS for that cancellation to
+    actually finish -- so a close() that swallows the cancellation and
+    keeps running left `_bounded_close` pending until close() eventually
+    decides to stop on its own, which is exactly the boundedness violation
+    the bounded-abandon mechanism removes (#67470 Sol xhigh mechanism
+    review, gap 1)."""
+    adapter = _make_adapter()
+    monkeypatch.setattr(ha_adapter, "_DRAIN_TIMEOUT", 0.05, raising=False)
+
+    stop = asyncio.Event()
+    close_truly_finished = asyncio.Event()
+
+    async def _suppresses_cancellation_until_stopped():
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=0.05)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                continue  # rude close(): swallows cancellation, keeps going
+        close_truly_finished.set()
+
+    closeable = MagicMock()
+    closeable.close = AsyncMock(side_effect=_suppresses_cancellation_until_stopped)
+
+    # Run _bounded_close as its OWN task (mirrors the bounded-abandon
+    # mechanism itself) and observe it with asyncio.wait(timeout=...)
+    # rather than wrapping the bare coroutine in another wait_for.
+    # asyncio.wait_for cancels the CURRENT task on timeout, not a separate
+    # one, for a bare coroutine argument -- nesting it around another
+    # wait_for(bare coroutine) that itself swallows cancellation forever
+    # (the exact defect under test) would make the outer wait_for's own
+    # cancellation land in that same swallow loop too and never escape,
+    # hanging the TEST instead of failing it. asyncio.wait() on an actual
+    # Task has no such trap: it only observes, never cancels.
+    bounded_close_task = asyncio.ensure_future(
+        adapter._bounded_close(closeable, "suppressing")
+    )
+    try:
+        done, pending = await asyncio.wait({bounded_close_task}, timeout=1)
+
+        assert not pending, (
+            "_bounded_close must return on its own within a bounded window "
+            "instead of hanging behind a cancellation-suppressing close "
+            "(pre-fix: asyncio.wait_for waits for the close's actual "
+            "completion after cancelling it, which a suppressing close "
+            "never delivers)"
+        )
+        assert not close_truly_finished.is_set(), (
+            "_bounded_close must abandon a cancellation-suppressing close "
+            "after _DRAIN_TIMEOUT instead of waiting for it to actually "
+            "finish"
+        )
+
+        # Corroborate durable retention alongside boundedness (Sol xhigh
+        # mechanism re-review: the first version of this test "does not
+        # prove module-level retention because it never forces GC after
+        # abandonment"; the second version kept a strong local reference
+        # to the task throughout, so surviving gc.collect() proved
+        # nothing about the registry -- it would have survived from the
+        # local alone). Find the abandoned inner close task (separate
+        # from bounded_close_task, the outer _bounded_close() call, which
+        # already completed above) in the module registry, take only a
+        # WEAK reference, drop every strong local including the list
+        # itself, force a collection, and confirm the weakref is still
+        # alive. NOTE (Sol xhigh follow-up, negative-control probe): this
+        # is corroborating evidence, not an isolated proof that
+        # _TEARDOWN_REGISTRY specifically is what kept it alive -- a task
+        # that is still actively scheduled (a live callback pending on
+        # its current await) can also survive collection via asyncio's
+        # own internal bookkeeping, independent of any registry. The
+        # DEFINITIVE proof of the retention mechanism is the direct `in
+        # _TEARDOWN_REGISTRY` membership check in
+        # test_abandoned_reconnect_does_not_publish_after_disconnect
+        # below; this assertion is a secondary sanity check, not the
+        # sole evidence.
+        abandoned = [t for t in ha_adapter._TEARDOWN_REGISTRY if not t.done()]
+        assert abandoned, "the abandoned close task must be rooted in the module registry"
+        abandoned_ref = weakref.ref(abandoned[0])
+        del abandoned
+        gc.collect()
+        still_alive = abandoned_ref()
+        assert still_alive is not None, (
+            "a forced gc.collect() destroyed the abandoned close task after "
+            "every local strong reference was dropped"
+        )
+        assert not still_alive.done(), (
+            "a forced gc.collect() must not destroy an abandoned close "
+            "that is still rooted in _TEARDOWN_REGISTRY"
+        )
+    finally:
+        # Test hygiene: let the abandoned close actually finish instead of
+        # leaving a zombie task behind -- unconditionally, even if an
+        # assertion above failed (on pre-fix code the close is genuinely
+        # still running at that point; without this in `finally`, the
+        # loop's own teardown would gather it, and it never finishes on
+        # its own since `stop` was never set, hanging the WHOLE suite
+        # instead of just failing this one test).
+        stop.set()
+        await asyncio.wait_for(close_truly_finished.wait(), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_ws_session_close_runs_when_ws_close_raises_cancellederror():
+    """A close() that raises CancelledError ON ITS OWN -- not from an
+    external task.cancel() -- must not abort the surrounding cleanup
+    sequence: the session close must still run after it (#67470 Sol xhigh
+    mechanism review, gap 3). Pre-fix, `_bounded_close` awaited
+    `closeable.close()` inline inside `_close_both()`; a self-raised
+    CancelledError propagated straight out of `_close_both()`, skipping
+    the session close entirely."""
+    adapter = _make_adapter()
+
+    ws = MagicMock()
+    ws.closed = False
+
+    async def _raises_cancelled_from_close():
+        raise asyncio.CancelledError("close() itself raises, not externally cancelled")
+
+    ws.close = AsyncMock(side_effect=_raises_cancelled_from_close)
+
+    session = MagicMock()
+    session.closed = False
+    session.close = AsyncMock()
+
+    adapter._ws = ws
+    adapter._session = session
+
+    await asyncio.wait_for(adapter._cleanup_ws(), timeout=2)
+
+    session.close.assert_awaited_once()
+    assert adapter._ws is None
+    assert adapter._session is None
+
+
+@pytest.mark.asyncio
+async def test_disconnect_rest_close_runs_when_ws_close_raises_cancellederror():
+    """The same close-originated-CancelledError protection must hold across
+    the whole disconnect() sequence, not just _cleanup_ws()'s own two
+    closes: the REST session close must still run after a WS close that
+    raises CancelledError on its own (#67470 Sol xhigh mechanism review,
+    gap 3)."""
+    adapter = _make_adapter()
+    adapter._running = True
+
+    ws = MagicMock()
+    ws.closed = False
+
+    async def _raises_cancelled_from_close():
+        raise asyncio.CancelledError("close() itself raises, not externally cancelled")
+
+    ws.close = AsyncMock(side_effect=_raises_cancelled_from_close)
+    adapter._ws = ws
+    adapter._session = None
+
+    rest_session = MagicMock()
+    rest_session.closed = False
+    rest_session.close = AsyncMock()
+    adapter._rest_session = rest_session
+
+    async def _noop():
+        return
+
+    adapter._listen_task = asyncio.ensure_future(_noop())
+    adapter._watchdog_task = asyncio.ensure_future(_noop())
+    await asyncio.sleep(0)
+
+    await asyncio.wait_for(adapter.disconnect(), timeout=2)
+
+    rest_session.close.assert_awaited_once()
+    assert adapter._rest_session is None
+
+
+@pytest.mark.asyncio
+async def test_send_fallback_session_closed_when_cancelled_mid_aexit(monkeypatch):
+    """S5 (send()'s fallback session used when no persistent
+    _rest_session exists) must still close the session when cancelled
+    while the RESPONSE context's own __aexit__ is still running -- not
+    just while the request itself is in flight (#67470 Sol xhigh
+    mechanism review, close site S5, state-machine row "inner HTTP-
+    response __aexit__ hangs before session exit"). The old `async with
+    aiohttp.ClientSession() as session:` relies on the implicit
+    `__aexit__` -> `await session.close()`; a cancellation landing while
+    an INNER __aexit__ (the response context) is running unwinds straight
+    past that outer __aexit__ too, on pre-fix code. The fix adopts the
+    session explicitly and closes it from a try/finally, which runs
+    regardless of where inside the try the cancellation actually lands."""
+    adapter = _make_adapter()
+
+    aexit_started = asyncio.Event()
+
+    class _HangsOnExitPostCtx:
+        async def __aenter__(self):
+            resp = MagicMock()
+            resp.status = 200
+            return resp
+
+        async def __aexit__(self, *exc_info):
+            aexit_started.set()
+            await asyncio.Event().wait()  # hang mid-__aexit__
+
+    mock_session = MagicMock()
+    mock_session.post = MagicMock(return_value=_HangsOnExitPostCtx())
+    mock_session.close = AsyncMock()
+
+    with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
+        mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+        mock_aiohttp.ClientTimeout = lambda total: total
+
+        task = asyncio.ensure_future(adapter.send("ha_events", "hi"))
+        await asyncio.wait_for(aexit_started.wait(), timeout=2)
+        task.cancel()  # lands inside the response context's own __aexit__
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    mock_session.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_session_closed_when_cancelled_mid_aexit():
+    """S6 (_standalone_send()'s ad-hoc session) must still close the
+    session when cancelled while the response context's own __aexit__ is
+    running -- same reasoning as S5 (#67470 Sol xhigh mechanism review,
+    close site S6)."""
+    aexit_started = asyncio.Event()
+
+    class _HangsOnExitPostCtx:
+        async def __aenter__(self):
+            resp = MagicMock()
+            resp.status = 200
+            return resp
+
+        async def __aexit__(self, *exc_info):
+            aexit_started.set()
+            await asyncio.Event().wait()  # hang mid-__aexit__
+
+    mock_session = MagicMock()
+    mock_session.post = MagicMock(return_value=_HangsOnExitPostCtx())
+    mock_session.close = AsyncMock()
+
+    pconfig = SimpleNamespace(token="tok", extra={"url": "http://ha.local:8123"})
+
+    with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
+        mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+        mock_aiohttp.ClientTimeout = lambda total: total
+
+        task = asyncio.ensure_future(
+            ha_adapter._standalone_send(pconfig, "ha_events", "hi")
+        )
+        await asyncio.wait_for(aexit_started.wait(), timeout=2)
+        task.cancel()  # lands inside the response context's own __aexit__
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    mock_session.close.assert_awaited_once()
+
+
+def _scripted_receive_json(pause_on_first_call=None, resume_event=None):
+    """Build a ``ws.receive_json`` side effect that plays the full
+    auth_required -> auth_ok -> subscribe-ack handshake sequence, pausing
+    on the FIRST call until *resume_event* fires if *pause_on_first_call*
+    is given. Shared by the generation-race tests below so each only has
+    to describe ITS pause point, not re-derive the handshake script."""
+    responses = iter([
+        {"type": "auth_required"},
+        {"type": "auth_ok"},
+        {"success": True},
+    ])
+    state = {"first": True}
+
+    async def _receive_json():
+        if state["first"]:
+            state["first"] = False
+            if pause_on_first_call is not None:
+                pause_on_first_call.set()
+                await resume_event.wait()
+        return next(responses)
+
+    return _receive_json
+
+
+def _make_mock_ws_and_session(receive_json_side_effect):
+    ws = MagicMock()
+    ws.closed = False
+    ws.close = AsyncMock()
+    ws.send_json = AsyncMock()
+    ws.receive_json = AsyncMock(side_effect=receive_json_side_effect)
+
+    session = MagicMock()
+    session.closed = False
+    session.close = AsyncMock()
+    session.ws_connect = AsyncMock(return_value=ws)
+    return ws, session
+
+
+@pytest.mark.asyncio
+async def test_connect_superseded_by_disconnect_does_not_publish():
+    """A disconnect() call that runs to completion while an earlier
+    connect() is still cold -- paused before ``session.ws_connect()`` even
+    returns, i.e. before ANYTHING has been built or published yet -- must
+    prevent that connect() from later publishing sessions, starting the
+    listener/watchdog, or setting _running=True (#67470 Sol xhigh
+    mechanism review, gap 5).
+
+    Drives the REAL _ws_connect() through mocked aiohttp primitives
+    (rather than monkeypatching _ws_connect() itself away) so the actual
+    generation-claim logic inside it runs -- a wholesale _ws_connect()
+    replacement hides exactly the race this mechanism exists to close
+    (Sol's REQUEST_CHANGES on the first version of this test: "patching
+    _ws_connect() hides the shared-field connect/connect and
+    reconnect/disconnect races"). Pauses at ``session.ws_connect()``
+    itself rather than inside the auth handshake: pre-fix code published
+    self._ws/self._session immediately after ws_connect() returned, BEFORE
+    the handshake started, so pausing mid-handshake would have raced
+    disconnect() against an ALREADY-published field on that code path --
+    a coincidentally-correct result for the wrong reason, not a real test
+    of "nothing published yet"."""
+    adapter = _make_adapter()
+
+    paused = asyncio.Event()
+    resume = asyncio.Event()
+
+    ws = MagicMock()
+    ws.closed = False
+    ws.close = AsyncMock()
+    ws.send_json = AsyncMock()
+    ws.receive_json = AsyncMock(side_effect=_scripted_receive_json())
+
+    async def _paused_ws_connect(*_args, **_kwargs):
+        paused.set()
+        await resume.wait()
+        return ws
+
+    session = MagicMock()
+    session.closed = False
+    session.close = AsyncMock()
+    session.ws_connect = AsyncMock(side_effect=_paused_ws_connect)
+
+    with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
+        mock_aiohttp.ClientTimeout = lambda total: total
+        mock_aiohttp.ClientSession = MagicMock(return_value=session)
+
+        connect_task = asyncio.ensure_future(adapter.connect())
+        await asyncio.wait_for(paused.wait(), timeout=2)
+
+        # disconnect() runs to completion while connect() is still cold --
+        # session.ws_connect() itself hasn't even returned, so NOTHING has
+        # been built yet, let alone published.
+        await asyncio.wait_for(adapter.disconnect(), timeout=2)
+        assert adapter._running is False
+        assert adapter._session is None
+        assert adapter._ws is None
+
+        # Let the superseded connect() attempt proceed through the whole
+        # handshake and reach the claim-and-publish step, which must now
+        # see a stale generation.
+        resume.set()
+        result = await asyncio.wait_for(connect_task, timeout=2)
+
+    assert result is False, "a superseded connect() must report failure"
+    assert adapter._running is False, "superseded connect() must not flip _running back on"
+    assert adapter._listen_task is None, "superseded connect() must not start a listener"
+    assert adapter._watchdog_task is None, "superseded connect() must not start a watchdog"
+    assert adapter._rest_session is None, "superseded connect() must not publish a REST session"
+    assert adapter._ws is None, "superseded connect() must not publish the WS it opened"
+    assert adapter._session is None, "superseded connect() must not publish the session it opened"
+
+    # The WS/session built locally after resuming must be cleaned up, not
+    # leaked.
+    ws.close.assert_awaited_once()
+    session.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_connect_loser_closes_own_resources_not_winners():
+    """Two overlapping connect() calls (#67470 Sol xhigh mechanism review,
+    gap 1 -- REQUEST_CHANGES finding 1 on the first version of this fix):
+    the LOSING attempt must close its OWN local ws/session, and must
+    NEVER touch the fields the WINNING attempt already published.
+
+    Pre-fix (both the original code and the first version of this
+    mechanism, which published to self._ws/self._session mid-handshake
+    and read them for the REST of the handshake too), two overlapping
+    _ws_connect() attempts could interleave across their own handshake
+    awaits and stomp on each other's shared fields: whichever finished
+    LAST silently published over the other's still-live session, and the
+    loser's generation-mismatch cleanup closed the SHARED fields -- which
+    by then belonged to the winner -- instead of its own resources."""
+    adapter = _make_adapter()
+
+    c1_paused = asyncio.Event()
+    resume_c1 = asyncio.Event()
+    ws1, session1 = _make_mock_ws_and_session(_scripted_receive_json(c1_paused, resume_c1))
+    ws2, session2 = _make_mock_ws_and_session(_scripted_receive_json())
+
+    def _session_factory():
+        yield session1
+        yield session2
+        # Anything beyond the two WS sessions above is the winner's
+        # dedicated REST session (aiohttp.ClientSession(...) in
+        # connect()'s success path) -- a plain throwaway is fine, this
+        # test isn't asserting on it.
+        while True:
+            rest = MagicMock()
+            rest.closed = False
+            rest.close = AsyncMock()
+            yield rest
+
+    sessions = _session_factory()
+
+    with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
+        mock_aiohttp.ClientTimeout = lambda total: total
+        mock_aiohttp.ClientSession = MagicMock(side_effect=lambda **_kw: next(sessions))
+
+        c1_task = asyncio.ensure_future(adapter.connect())
+        await asyncio.wait_for(c1_paused.wait(), timeout=2)
+
+        # C2 starts and runs all the way through while C1 is still paused
+        # mid-handshake -- C2 wins the race and claims the generation.
+        c2_result = await asyncio.wait_for(adapter.connect(), timeout=2)
+        assert c2_result is True
+        assert adapter._ws is ws2
+        assert adapter._session is session2
+
+        # Let C1 finish its now-stale handshake and reach the claim step.
+        resume_c1.set()
+        c1_result = await asyncio.wait_for(c1_task, timeout=2)
+
+        assert c1_result is False, "the losing connect() attempt must report failure"
+        # The winner's resources must be untouched by the loser's cleanup.
+        assert adapter._ws is ws2
+        assert adapter._session is session2
+        ws2.close.assert_not_awaited()
+        session2.close.assert_not_awaited()
+        # The loser must close its OWN resources, not leak them, and must
+        # not have closed the winner's.
+        ws1.close.assert_awaited_once()
+        session1.close.assert_awaited_once()
+
+    # Hygiene: tear down C2's now-live adapter (listener/watchdog tasks,
+    # winner's WS/session) via the real disconnect() path.
+    await asyncio.wait_for(adapter.disconnect(), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_abandoned_reconnect_does_not_publish_after_disconnect(monkeypatch):
+    """A _ws_connect() attempt running inside a task that
+    _cancel_task_bounded() gives up waiting for (because the handshake
+    suppresses cancellation) must not publish once disconnect() has
+    already moved on (#67470 Sol xhigh mechanism review, gap 5 follow-up
+    -- REQUEST_CHANGES finding 2 on the first version of this fix: the
+    reconnect ladder in _listen_loop calls _ws_connect() directly and had
+    no generation protection at all, and the abandoned task itself wasn't
+    rooted anywhere once its caller cleared its own reference).
+
+    Exercises both halves of the fix: the abandoned task must survive
+    being unrooted by its caller (checked directly against the
+    module-level registry -- Sol's note that the first version's
+    determinism test "does not prove module-level retention because it
+    never forces GC after abandonment" applies here too), and once it
+    does resume, it must back off instead of publishing
+    self._session/self._ws after disconnect() already tore the adapter
+    down."""
+    adapter = _make_adapter()
+    monkeypatch.setattr(ha_adapter, "_DRAIN_TIMEOUT", 0.05, raising=False)
+
+    cancelled_once = asyncio.Event()
+    resume_after_cancel = asyncio.Event()
+    responses = iter([
+        {"type": "auth_required"},
+        {"type": "auth_ok"},
+        {"success": True},
+    ])
+    first_call = True
+
+    async def _receive_json():
+        nonlocal first_call
+        if first_call:
+            first_call = False
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Rude handshake step: swallows the cancellation
+                # _cancel_task_bounded() delivers and keeps running,
+                # exactly the scenario that makes it give up and abandon
+                # this task instead of waiting forever.
+                cancelled_once.set()
+                await resume_after_cancel.wait()
+        return next(responses)
+
+    ws = MagicMock()
+    ws.closed = False
+    ws.close = AsyncMock()
+    ws.send_json = AsyncMock()
+    ws.receive_json = AsyncMock(side_effect=_receive_json)
+
+    session = MagicMock()
+    session.closed = False
+    session.close = AsyncMock()
+    session.ws_connect = AsyncMock(return_value=ws)
+
+    with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
+        mock_aiohttp.ClientTimeout = lambda total: total
+        mock_aiohttp.ClientSession = MagicMock(return_value=session)
+
+        reconnect_task = asyncio.ensure_future(adapter._ws_connect())
+        await asyncio.sleep(0)  # let it reach the first receive_json() await
+
+        # Mirrors disconnect()'s _cancel_task_bounded(self._listen_task,
+        # ...) call: cancel once, then give up after _DRAIN_TIMEOUT
+        # because the handshake step suppresses it.
+        await adapter._cancel_task_bounded(reconnect_task, "reconnect attempt")
+        await asyncio.wait_for(cancelled_once.wait(), timeout=2)
+        assert not reconnect_task.done(), (
+            "the task must still be running -- abandoned, not destroyed"
+        )
+        assert reconnect_task in ha_adapter._TEARDOWN_REGISTRY, (
+            "an abandoned task must be rooted at module scope or it can "
+            "be garbage-collected before it ever reaches the generation "
+            "check below"
+        )
+
+        # disconnect() proper runs next, exactly as it would have right
+        # after giving up on the listen task -- moves the generation
+        # forward. self._listen_task/self._watchdog_task are already
+        # None here so this is a fast no-op past the generation bump.
+        await asyncio.wait_for(adapter.disconnect(), timeout=2)
+
+        # Let the abandoned reconnect finish its (suppressed-cancellation)
+        # handshake and reach the claim step.
+        resume_after_cancel.set()
+        result = await asyncio.wait_for(reconnect_task, timeout=2)
+
+    assert result is False, (
+        "an abandoned reconnect superseded by disconnect() must not "
+        "report success"
+    )
+    assert adapter._ws is None, "must not publish after disconnect() moved the generation"
+    assert adapter._session is None
+    ws.close.assert_awaited_once()
+    session.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ws_connect_rejection_cleanup_not_double_closed_on_cancellation():
+    """A cancellation landing while a protocol-rejection branch's own
+    cleanup is still running must not trigger a SECOND, independent close
+    sequence for the same ws/session (#67470 Sol xhigh mechanism review
+    follow-up on the local-handshake refactor).
+
+    The three protocol-rejection branches (unexpected auth_required,
+    auth failed, subscribe failed) call the local cleanup from INSIDE the
+    handshake's try block, which shares a sibling `except
+    asyncio.CancelledError:` handler. Pre-fix, a cancellation landing
+    while that first cleanup call was itself awaiting its shielded close
+    propagated out to the sibling handler, which called cleanup again
+    with the same ws/session objects -- confirmed by Sol's own probe:
+    ws.close()/session.close() each awaited twice for one failed
+    connection attempt."""
+    adapter = _make_adapter()
+
+    close_started = asyncio.Event()
+    close_call_count = 0
+
+    async def _slow_ws_close():
+        nonlocal close_call_count
+        close_call_count += 1
+        close_started.set()
+        await asyncio.sleep(0.05)
+
+    ws = MagicMock()
+    ws.closed = False
+    ws.close = AsyncMock(side_effect=_slow_ws_close)
+    ws.send_json = AsyncMock()
+    # Protocol rejection: an unexpected type on the very first receive
+    # triggers the "Expected auth_required" branch immediately.
+    ws.receive_json = AsyncMock(return_value={"type": "unexpected"})
+
+    session = MagicMock()
+    session.closed = False
+    session.close = AsyncMock()
+    session.ws_connect = AsyncMock(return_value=ws)
+
+    with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
+        mock_aiohttp.ClientTimeout = lambda total: total
+        mock_aiohttp.ClientSession = MagicMock(return_value=session)
+
+        task = asyncio.ensure_future(adapter._ws_connect())
+        await asyncio.wait_for(close_started.wait(), timeout=2)
+        # Snapshot the shielded close's tracked task now (it must already
+        # exist -- close_started fires from inside it) so we can wait for
+        # the WHOLE thing to finish afterward, deterministically (same
+        # pattern as the other hardened tests in this file).
+        tracked = tuple(adapter._teardown_tasks)
+        task.cancel()  # lands while the rejection branch's own cleanup
+        # (_close_ws_and_session, awaiting its shielded close) is running
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    await _await_tracked_teardown(tracked)
+    assert close_call_count == 1, (
+        "a cancellation landing mid-cleanup must not trigger a second, "
+        "independent close sequence for the same ws/session"
+    )
+    ws.close.assert_awaited_once()
+    session.close.assert_awaited_once()
