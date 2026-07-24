@@ -724,6 +724,18 @@ def _has_unscannable_depth0_construct(command: str) -> bool:
     `A && B` & `` rewrote to the unmatched-backtick syntax error `` echo
     `A && { B` & } ``; a backtick embedded mid-word, `${x:-A&&B}`, and
     `[[ -n x && -n y ]]` all reproduce the same corruption).
+
+    Only single quotes are treated as a skip region. POSIX single quotes
+    are fully inert (no escapes, no expansions, nothing can appear inside
+    them that changes this scan), so it's safe to jump straight to the
+    matching close quote. Double quotes are deliberately walked character
+    by character instead of skipped: a backtick substitution can carry its
+    *own* double-quoted argument (e.g. `` echo "x`printf "%s && %s" A B`y"
+    & `` ), and that inner `"` can pair up with the outer `"` under this
+    scanner's naive same-character matching, closing the outer string
+    early and letting the substitution's own closing backtick slip past
+    undetected. Not skipping double-quoted spans means a `` ` ``/`${`/`[[`
+    is caught no matter which side of a `"` it lands on.
     """
     i = 0
     n = len(command)
@@ -739,19 +751,6 @@ def _has_unscannable_depth0_construct(command: str) -> bool:
             while i < n and command[i] != "'":
                 i += 1
             if i < n:
-                i += 1
-            continue
-
-        if ch == '"':
-            i += 1
-            while i < n:
-                inner = command[i]
-                if inner == "\\" and i + 1 < n:
-                    i += 2
-                    continue
-                if inner == '"':
-                    i += 1
-                    break
                 i += 1
             continue
 

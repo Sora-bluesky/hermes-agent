@@ -382,9 +382,20 @@ class TestBacktickSubstitutionUntouched:
         cmd = "echo 'A `x` B' && C &"
         assert rewrite(cmd) == "echo 'A `x` B' && { C & }"
 
-    def test_backtick_inside_double_quotes_not_mistaken(self):
+    def test_backtick_inside_double_quotes_now_bails(self):
+        # Sol xhigh (third pass) found that treating double-quoted content
+        # as exempt from the backtick scan is itself unsafe: a backtick
+        # substitution can carry its own double-quoted argument whose `"`
+        # realigns with the *outer* `"` under this scanner's naive
+        # same-character quote matching, letting the substitution's own
+        # closing backtick slip past undetected (see
+        # TestNestedQuoteInsideBacktick below for the exact counterexample).
+        # So a backtick inside double quotes is no longer treated as safe
+        # to rewrite around -- it now bails the whole command, same as an
+        # unquoted one. Single quotes remain the one fully-inert exemption
+        # (see test_backtick_inside_single_quotes_not_mistaken above).
         cmd = 'echo "A `x` B" && C &'
-        assert rewrite(cmd) == 'echo "A `x` B" && { C & }'
+        assert rewrite(cmd) == cmd
 
     def test_backtick_compound_stays_valid_bash(self):
         # C1: executable check (bash -n), not just a string comparison --
@@ -479,20 +490,63 @@ class TestUnscannableDepth0ConstructsBailWhole:
                 f"(rc={out.returncode}): {out.stderr}"
             )
 
-    def test_parameter_expansion_inside_double_quotes_still_rewritable(self):
-        # `${...}` inside double quotes is already opaque to the main
-        # scanner via the existing quote-handling branch -- the pre-scan's
-        # own quote tracking must agree, not double-bail.
+    def test_parameter_expansion_inside_double_quotes_now_bails(self):
+        # Double quotes are no longer treated as an exempt region for this
+        # pre-scan (see TestNestedQuoteInsideBacktick below for why) -- a
+        # `${` inside double quotes now bails too, not just an unquoted one.
         cmd = 'echo "${x:-A&&B}" && C &'
-        assert rewrite(cmd) == 'echo "${x:-A&&B}" && { C & }'
+        assert rewrite(cmd) == cmd
 
     def test_conditional_bracket_inside_single_quotes_still_rewritable(self):
+        # Single quotes are the one fully-inert exemption that remains --
+        # nothing inside them can carry its own nested quoting or escapes.
         cmd = "echo '[[ literal ]]' && C &"
         assert rewrite(cmd) == "echo '[[ literal ]]' && { C & }"
 
-    def test_backtick_embedded_mid_word_inside_double_quotes_still_rewritable(self):
+    def test_backtick_embedded_mid_word_inside_double_quotes_now_bails(self):
         cmd = 'echo "pre`x`post" && C &'
-        assert rewrite(cmd) == 'echo "pre`x`post" && { C & }'
+        assert rewrite(cmd) == cmd
+
+
+class TestNestedQuoteInsideBacktick:
+    """Sol xhigh review (#68948, third pass) found that treating
+    double-quoted content as a skip region in the pre-scan was itself
+    unsafe: a backtick substitution can carry its own double-quoted
+    argument, and that inner `"` can pair up with the *outer* `"` under
+    this scanner's naive same-character quote matching -- prematurely
+    'closing' the outer string and letting the substitution's own closing
+    backtick slip past undetected. Fix: the pre-scan no longer skips
+    double-quoted spans at all (only single quotes are fully inert and
+    safe to skip); a backtick/`${`/`[[` is now caught no matter which side
+    of a `"` it lands on.
+    """
+
+    def test_backtick_with_nested_double_quoted_argument_untouched(self):
+        # The exact counterexample: `printf`'s own quoted arg contains an
+        # even number of `"` that realign with the outer quote, hiding the
+        # substitution's closing backtick from a quote-skipping scan.
+        cmd = 'echo "x`printf "%s && %s" A B`y" &'
+        assert rewrite(cmd) == cmd
+
+    def test_backtick_with_nested_double_quoted_argument_stays_valid_bash(self):
+        shutil = pytest.importorskip("shutil")
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available")
+        cmd = 'echo "x`printf "%s && %s" A B`y" &'
+        orig = subprocess.run(
+            ["bash", "-n", "-c", cmd], capture_output=True, text=True
+        )
+        assert orig.returncode == 0, (
+            f"expected {cmd!r} to be valid bash: {orig.stderr}"
+        )
+        rewritten = rewrite(cmd)
+        out = subprocess.run(
+            ["bash", "-n", "-c", rewritten], capture_output=True, text=True
+        )
+        assert out.returncode == 0, (
+            f"rewriter turned valid {cmd!r} into invalid {rewritten!r} "
+            f"(rc={out.returncode}): {out.stderr}"
+        )
 
 
 class TestEdgeCases:
