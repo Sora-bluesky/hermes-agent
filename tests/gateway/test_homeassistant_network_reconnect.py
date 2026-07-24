@@ -1284,6 +1284,7 @@ async def test_abandoned_reconnect_does_not_publish_after_disconnect(monkeypatch
     adapter = _make_adapter()
     monkeypatch.setattr(ha_adapter, "_DRAIN_TIMEOUT", 0.05, raising=False)
 
+    started = asyncio.Event()
     cancelled_once = asyncio.Event()
     resume_after_cancel = asyncio.Event()
     responses = iter([
@@ -1291,22 +1292,29 @@ async def test_abandoned_reconnect_does_not_publish_after_disconnect(monkeypatch
         {"type": "auth_ok"},
         {"success": True},
     ])
-    first_call = True
 
     async def _receive_json():
-        nonlocal first_call
-        if first_call:
-            first_call = False
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                # Rude handshake step: swallows the cancellation
-                # _cancel_task_bounded() delivers and keeps running,
-                # exactly the scenario that makes it give up and abandon
-                # this task instead of waiting forever.
-                cancelled_once.set()
-                await resume_after_cancel.wait()
+        # Plain scripted handshake -- NO cancellation swallow here. On 3.11
+        # asyncio.wait_for cancels its inner future and re-raises
+        # CancelledError even when the wrapped coro swallowed it, so a swallow
+        # inside this wait_for-wrapped receive (adapter.py) can't survive to
+        # the generation-claim step. The suppressed-cancellation wedge is
+        # simulated at the BARE session.ws_connect() await below instead --
+        # which is exactly the uncancellable await the mechanism exists for.
         return next(responses)
+
+    async def _wedged_ws_connect(*_args, **_kwargs):
+        # A reconnect attempt wedged on an uncancellable await (ws_connect is
+        # a bare await with no local bound): swallow the cancellation
+        # _cancel_task_bounded() delivers and keep running -- exactly what
+        # makes it give up and abandon this task instead of waiting forever.
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled_once.set()
+            await resume_after_cancel.wait()
+        return ws
 
     ws = MagicMock()
     ws.closed = False
@@ -1317,18 +1325,18 @@ async def test_abandoned_reconnect_does_not_publish_after_disconnect(monkeypatch
     session = MagicMock()
     session.closed = False
     session.close = AsyncMock()
-    session.ws_connect = AsyncMock(return_value=ws)
+    session.ws_connect = AsyncMock(side_effect=_wedged_ws_connect)
 
     with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
         mock_aiohttp.ClientTimeout = lambda total: total
         mock_aiohttp.ClientSession = MagicMock(return_value=session)
 
         reconnect_task = asyncio.ensure_future(adapter._ws_connect())
-        await asyncio.sleep(0)  # let it reach the first receive_json() await
+        await asyncio.wait_for(started.wait(), timeout=2)  # parked in ws_connect
 
         # Mirrors disconnect()'s _cancel_task_bounded(self._listen_task,
         # ...) call: cancel once, then give up after _DRAIN_TIMEOUT
-        # because the handshake step suppresses it.
+        # because the wedged step suppresses it.
         await adapter._cancel_task_bounded(reconnect_task, "reconnect attempt")
         await asyncio.wait_for(cancelled_once.wait(), timeout=2)
         assert not reconnect_task.done(), (
