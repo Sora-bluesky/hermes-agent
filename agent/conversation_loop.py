@@ -434,42 +434,52 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             )
 
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
-        # Continuing session — reuse the exact system prompt from the
-        # previous turn so the Anthropic cache prefix matches.
-        agent._cached_system_prompt = stored_prompt
-        # Reconstruct the cross-session-stable prefix for the early cache
-        # breakpoint. The static prefix is not persisted (only the full
-        # prompt is), so gateway surfaces that build a fresh AIAgent per
-        # turn would otherwise lose the two-block system layout after the
-        # first turn — flip-flopping the wire shape mid-conversation and
-        # silently degrading to the legacy single-breakpoint layout.
+        # Continuing session — reuse candidate. Before reusing, rebuild the
+        # cross-session-stable tier and compare: ``_stored_prompt_matches_runtime``
+        # only rejects Model/Provider/cwd/Platform drift, so CONTENT drift in
+        # the stable tier (SOUL.md edited, skills changed) would otherwise be
+        # reused verbatim for the rest of the session (issue #68563 — identity
+        # edits never reached continuing sessions). The ``startswith``
+        # comparison that used to guard only the cache layout is the reuse
+        # decision now, so it runs regardless of ``_use_prompt_caching``:
+        # staleness is about content, not cache layout.
         #
-        # Safety: the rebuilt stable tier is used ONLY when the restored
-        # prompt literally starts with it (checked here AND re-checked by
-        # ``_apply_system_cache_markers``'s ``startswith`` gate). If any
-        # stable-tier input changed since the prompt was persisted (skills
-        # edited, identity changed), the prefix mismatches, ``_static``
-        # stays None, and the request falls back to the legacy layout with
-        # the restored prompt bytes untouched — never a rewritten prompt.
-        #
-        # Gated on ``_use_prompt_caching`` so non-Anthropic routes skip the
-        # rebuild entirely (the static prefix is only consumed by
-        # ``apply_anthropic_cache_control``).
-        if getattr(agent, "_use_prompt_caching", False):
-            try:
-                from agent.system_prompt import build_system_prompt_parts as _build_parts
+        # Fail-open direction: if the parts builder fails or yields an empty
+        # stable tier, there is no basis to judge staleness — keep the
+        # restore (a rebuild would depend on the same builder). The stable
+        # tier holds no volatile content (timestamps live in the volatile
+        # tier), so a mismatch means a real input change, and the rebuild
+        # below re-persists — the next turn matches again instead of
+        # rebuild-looping.
+        _static = None
+        try:
+            from agent.system_prompt import build_system_prompt_parts as _build_parts
 
-                _static = _build_parts(agent, system_message=system_message)["stable"]
-                if _static and stored_prompt.startswith(_static):
-                    agent._cached_system_prompt_static = _static
-            except Exception:
-                # Fail-open: restore continues with the legacy cache layout.
-                logger.debug(
-                    "static system-prefix reconstruction failed on restore",
-                    exc_info=True,
-                )
-        return
-    if stored_prompt:
+            _static = _build_parts(agent, system_message=system_message)["stable"]
+        except Exception:
+            logger.debug(
+                "static system-prefix reconstruction failed on restore",
+                exc_info=True,
+            )
+        if _static and not stored_prompt.startswith(_static):
+            stored_state = "stale_stable_tier"
+            logger.info(
+                "Stored system prompt for session %s has a stale stable tier "
+                "(identity/skills inputs changed since it was persisted); "
+                "rebuilding.",
+                agent.session_id,
+            )
+        else:
+            agent._cached_system_prompt = stored_prompt
+            # The reconstructed prefix doubles as the early cache
+            # breakpoint. That attr is only consumed by
+            # ``apply_anthropic_cache_control``, so it stays gated on
+            # ``_use_prompt_caching`` (and re-checked by
+            # ``_apply_system_cache_markers``'s ``startswith`` gate).
+            if _static and getattr(agent, "_use_prompt_caching", False):
+                agent._cached_system_prompt_static = _static
+            return
+    elif stored_prompt:
         stored_state = "stale_runtime"
         logger.info(
             "Stored system prompt for session %s has stale runtime identity; "

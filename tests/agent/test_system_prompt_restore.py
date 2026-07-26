@@ -40,6 +40,19 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     return agent
 
 
+@pytest.fixture(autouse=True)
+def _neutral_parts_builder(monkeypatch):
+    """Reuse now consults the stable tier on every restore (issue #68563), so
+    the real parts builder would run against these MagicMock agents and
+    produce junk that randomly flips the staleness decision. Default it to
+    "unknown" (empty stable = no basis to judge, keep the restore); tests
+    that exercise the staleness contract override it with explicit values."""
+    monkeypatch.setattr(
+        "agent.system_prompt.build_system_prompt_parts",
+        lambda agent, system_message=None: {"stable": "", "context": "", "volatile": ""},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Happy paths
 # ---------------------------------------------------------------------------
@@ -303,9 +316,11 @@ class TestStaticPrefixReconstructionOnRestore:
         assert agent._cached_system_prompt == stored
         assert agent._cached_system_prompt_static == stable
 
-    def test_restore_leaves_static_unset_on_prefix_mismatch(self):
-        """Stable-tier drift (skills edited since persist) → no static prefix,
-        legacy layout, restored bytes still authoritative."""
+    def test_restore_rebuilds_on_stable_tier_mismatch(self):
+        """Stable-tier drift (SOUL.md / skills edited since persist) → the
+        stored prompt is STALE CONTENT, not just a cache-layout problem.
+        Reusing it verbatim was issue #68563: identity edits never reached
+        continuing sessions. The mismatch now rebuilds and re-persists."""
         stored = "OLD STATIC HEAD\n\nper-session context"
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": stored}
@@ -323,8 +338,11 @@ class TestStaticPrefixReconstructionOnRestore:
                 agent, None, [{"role": "user", "content": "hi"}]
             )
 
-        assert agent._cached_system_prompt == stored
-        assert agent._cached_system_prompt_static is None
+        assert agent._cached_system_prompt == "BUILT_PROMPT"
+        agent._build_system_prompt.assert_called_once()
+        db.update_system_prompt.assert_called_once_with(
+            "test-session-id", "BUILT_PROMPT"
+        )
 
     def test_restore_survives_parts_builder_exception(self):
         """Prefix reconstruction is fail-open: a parts-builder crash must not
@@ -348,6 +366,102 @@ class TestStaticPrefixReconstructionOnRestore:
 
         assert agent._cached_system_prompt == stored
         assert agent._cached_system_prompt_static is None
+
+
+# ---------------------------------------------------------------------------
+# Stable-tier staleness rebuild (issue #68563)
+# ---------------------------------------------------------------------------
+
+
+class TestStableTierStalenessRebuild:
+    """SOUL.md / skills edits must reach continuing sessions.
+
+    ``_stored_prompt_matches_runtime`` only rejects Model/Provider/cwd/
+    Platform drift; content drift in the stable tier previously left the
+    stale prompt reused verbatim forever (issue #68563). The ``startswith``
+    comparison that already guarded the cache layout is now the reuse
+    decision itself — and it must run regardless of ``_use_prompt_caching``,
+    because the decision is about content, not cache layout."""
+
+    def test_stale_stable_tier_rebuilds_without_prompt_caching(self, caplog):
+        stored = "OLD SOUL IDENTITY\n\nper-session context"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db)
+        assert agent._use_prompt_caching is False
+
+        from unittest.mock import patch as _patch
+
+        with _patch(
+            "agent.system_prompt.build_system_prompt_parts",
+            return_value={"stable": "NEW SOUL IDENTITY", "context": "", "volatile": ""},
+        ), caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+
+        assert agent._cached_system_prompt == "BUILT_PROMPT"
+        agent._build_system_prompt.assert_called_once()
+        db.update_system_prompt.assert_called_once()
+        assert any("stable tier" in r.getMessage() for r in caplog.records)
+
+    def test_matching_stable_tier_reuses_without_prompt_caching(self):
+        stable = "CURRENT SOUL IDENTITY"
+        stored = stable + "\n\nper-session context"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db)
+        agent._cached_system_prompt_static = None
+
+        from unittest.mock import patch as _patch
+
+        with _patch(
+            "agent.system_prompt.build_system_prompt_parts",
+            return_value={"stable": stable, "context": "", "volatile": ""},
+        ):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
+        # Cache layout attr stays gated on _use_prompt_caching.
+        assert agent._cached_system_prompt_static is None
+
+    def test_empty_stable_tier_gives_no_basis_to_judge_and_reuses(self):
+        """An empty stable tier means "cannot judge", not "stale" — the
+        autouse neutral builder returns exactly that, so this pins the
+        fail-open direction explicitly."""
+        stored = "Stored prompt from turn 1"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db)
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "hi"}]
+        )
+
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
+
+    def test_builder_exception_fails_open_to_reuse_without_prompt_caching(self):
+        stored = "Stored prompt — must survive"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db)
+
+        from unittest.mock import patch as _patch
+
+        with _patch(
+            "agent.system_prompt.build_system_prompt_parts",
+            side_effect=RuntimeError("boom"),
+        ):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
 
 
 if __name__ == "__main__":
