@@ -704,38 +704,21 @@ def _sudo_nopasswd_works() -> bool:
 
 
 def _has_unscannable_depth0_construct(command: str) -> bool:
-    """Return True when *command* contains, outside quotes and unescaped,
-    a construct whose own internal `&&`/`||`/`&` this character-at-a-time
-    scanner cannot distinguish from a top-level chain/background operator:
+    """Return True when *command* contains, outside single quotes and
+    unescaped, a construct whose own internal `&&`/`||`/`&` the rewrite
+    scanner would mistake for a top-level operator: legacy backtick
+    substitution, `${...}` parameter expansion, or a `[[ ... ]]`
+    conditional. Misreading any of them corrupted valid bash into invalid
+    bash (#68948 review: `` echo `A && B` & `` → `` echo `A && { B` & } ``,
+    an unmatched-backtick syntax error; `${x:-A&&B} &` and
+    `[[ -n x && -n y ]] &` reproduce the same inversion).
 
-    - a legacy backtick command substitution (`` `cmd` ``) -- has its own
-      POSIX quoting/escaping rules this scanner doesn't reproduce;
-    - a `${...}` parameter expansion -- `{` right after `$` is not the
-      brace-*group* `{ ` the main scan tracks (that one requires a space),
-      so unlike `(...)`/`{ ...; }` its contents pass through unguarded;
-    - a `[[ ... ]]` conditional -- its `&&`/`||` are the construct's own
-      logical operators, not command-list separators.
-
-    Deliberately quote-aware only, not paren/brace-depth-aware: a single,
-    easy-to-verify pass that only ever adds bailouts, never narrows them.
-    Over-bailing (skipping an otherwise-safe rewrite) is the accepted
-    cost -- it must never let the scan below mistake one of these
-    constructs' internals for real operators (#68948 review: `` echo
-    `A && B` & `` rewrote to the unmatched-backtick syntax error `` echo
-    `A && { B` & } ``; a backtick embedded mid-word, `${x:-A&&B}`, and
-    `[[ -n x && -n y ]]` all reproduce the same corruption).
-
-    Only single quotes are treated as a skip region. POSIX single quotes
-    are fully inert (no escapes, no expansions, nothing can appear inside
-    them that changes this scan), so it's safe to jump straight to the
-    matching close quote. Double quotes are deliberately walked character
-    by character instead of skipped: a backtick substitution can carry its
-    *own* double-quoted argument (e.g. `` echo "x`printf "%s && %s" A B`y"
-    & `` ), and that inner `"` can pair up with the outer `"` under this
-    scanner's naive same-character matching, closing the outer string
-    early and letting the substitution's own closing backtick slip past
-    undetected. Not skipping double-quoted spans means a `` ` ``/`${`/`[[`
-    is caught no matter which side of a `"` it lands on.
+    Over-bailing is the accepted cost. Single quotes are skipped as a
+    region (POSIX makes them fully inert); double quotes are walked
+    character by character instead, because a backtick substitution can
+    carry its own double-quoted argument (`` echo "x`printf "%s && %s" A
+    B`y" & ``) whose inner `"` closes the outer string under naive
+    same-character pairing and lets the closing backtick slip past.
     """
     i = 0
     n = len(command)
@@ -791,58 +774,22 @@ def _rewrite_compound_background(command: str) -> str:
     strings and parenthesised subshells. Leaves simple ``cmd &`` alone —
     that construct doesn't have the subshell-wait bug.
 
-    A rewritten tail is a brace *group*, not a subshell, so bash requires
-    a statement terminator after the closing ``}`` before anything else
-    on the same line — otherwise ``{ B & } C`` is a syntax error at parse
-    time. Rather than insert a separator (which would change `C`'s
-    scheduling: originally `A && B & C` backgrounds the whole `A && B`
-    compound as one job and runs `C` immediately, so inserting `;` would
-    make `C` wait on `A` first — a real, measured behavior change, not
-    just a cosmetic one), this rewriter simply **skips** rewriting a
-    statement when a same-line command follows the backgrounding `&`.
-    That leaves the original (leaky but correct) bash behavior fully
-    intact for that shape rather than trade a syntax error for a
-    scheduling change.
+    Skipped shapes (each leaves the original, leaky-but-correct bash
+    intact rather than risk changing what the command means):
 
-    Deliberate non-goal: the parenthesised spelling of this same bug,
-    `(A && B) &`, is left untouched. An earlier version of this function
-    attempted to rewrite the inside of the parens too, but that requires
-    textually parsing an arbitrary subshell body — which cannot be made
-    safe in general. Concretely it mis-rewrote arithmetic contexts
-    (`(( 1+1 )) &` — the outer double-paren is arithmetic evaluation, not
-    two nested subshells, but a textual parens-matcher can't tell the
-    difference and turned it into `({ ( 1+1 ) & }) &`, which runs `1+1`
-    as a *command* instead of evaluating it, a silent behavior change,
-    not just a syntax error) and would equally mishandle heredocs,
-    backtick substitutions, and reserved-word compounds (`while`, `case`,
-    `for`) if extended further. Two things make leaving this case alone
-    acceptable: (1) the top-level shell never blocks on a backgrounded
-    subshell either way (`(A && B) &` returns to the caller immediately,
-    verified — this is standard job-control behavior, not something the
-    rewrite needs to fix), and (2) the terminal tool's own hang risk from
-    a backgrounded process inheriting the stdout pipe is already handled
-    generically by the idle-after-exit drain timeout in
-    ``tools/environments/base.py`` (issue #8340), independent of shell
-    spelling. What's left unfixed is purely the resource-hygiene cost of
-    a leaked subshell stuck in ``wait4`` — a real but much smaller
-    problem than a silent semantic corruption, so it's accepted rather
-    than chased with more textual rewriting.
-
-    A second, narrower non-goal in the same family: legacy backtick
-    substitution (`` `cmd` ``), `${...}` parameter expansion, and `[[ ... ]]`
-    conditionals can all contain `&&`, `||`, or `&` of their own, with
-    parsing rules this scanner doesn't reproduce (see
-    ``_has_unscannable_depth0_construct``). Misreading their contents as
-    top-level operators previously corrupted valid bash into invalid bash
-    (`` echo `A && B` & `` → `` echo `A && { B` & } ``, an unmatched-backtick
-    syntax error — #68948 review; also reproduced with a backtick embedded
-    mid-word, `${x:-A&&B} &`, and `[[ -n x && -n y ]] &`). Rather than
-    textually track each construct's own matching delimiter, a pre-scan
-    bails out and returns the *whole* command unchanged the moment any of
-    them appears unquoted. That's more conservative than the parenthesised
-    case (which only skips content inside the parens, not the whole
-    command) because there is no reliable way to know where these
-    constructs end without reproducing their own grammar.
+    - `A && B & C` (same-line continuation): a brace group needs a
+      terminator before `C`, and inserting one would make `C` wait on `A`
+      instead of running immediately — a real scheduling change.
+    - `(A && B) &`: rewriting inside parens mis-parsed arithmetic
+      (`(( 1+1 )) &`) and can't be made safe textually. The subshell-wait
+      hang doesn't apply here, and pipe-inherit hangs are handled
+      generically by the drain timeout in ``tools/environments/base.py``
+      (#8340); only the leaked-subshell hygiene cost remains.
+    - Any command containing an unquoted backtick substitution, `${...}`
+      expansion, or `[[ ... ]]` conditional: their internal `&&`/`||`/`&`
+      previously corrupted valid bash into invalid bash (#68948 review),
+      so ``_has_unscannable_depth0_construct`` bails on the whole command
+      rather than reproduce each construct's grammar.
     """
     if _has_unscannable_depth0_construct(command):
         return command
