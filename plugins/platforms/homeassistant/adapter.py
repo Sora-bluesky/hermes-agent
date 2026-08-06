@@ -70,6 +70,19 @@ _DRAIN_TIMEOUT = 5.0
 # accepts the socket but never responds can't freeze _ws_connect() forever.
 # Refs: NousResearch/hermes-agent#67470
 _HANDSHAKE_TIMEOUT = 30.0
+# Cause-agnostic watchdog (#67470, mirrors the Telegram adapter's wedged-
+# recovery watchdog, commit c2cb37532): if _listen_loop stops making progress
+# -- wedged on an await no local bound covers -- for this long while the
+# adapter is still "running", nothing else notices and the gateway goes
+# silently deaf. The watchdog force-cancels and respawns it.
+_LISTEN_STUCK_TIMEOUT = 300.0
+# How often the watchdog checks _last_progress against _LISTEN_STUCK_TIMEOUT.
+_WATCHDOG_INTERVAL = 60.0
+# After the watchdog's HA-protocol ping, how long to wait for the pong to
+# surface as reader progress before declaring the listener wedged. The pong
+# arrives through _read_events' async-for (single-reader invariant), so the
+# watchdog observes it indirectly via _last_progress.
+_PING_GRACE = 10.0
 
 
 # Durable, module-level (NOT adapter-instance-level) retention for in-flight
@@ -178,6 +191,7 @@ async def _run_bounded_close(closeable: Any, label: str, *, context: str) -> Non
         )
 
 
+
 def check_ha_requirements() -> bool:
     """Check if Home Assistant runtime dependencies are available."""
     return AIOHTTP_AVAILABLE
@@ -211,6 +225,7 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         self._ws: Optional["aiohttp.ClientWebSocketResponse"] = None
         self._rest_session: Optional["aiohttp.ClientSession"] = None
         self._listen_task: Optional[asyncio.Task] = None
+        self._watchdog_task: Optional[asyncio.Task] = None
         # Strong references for in-flight closes started by
         # _cancel_safe_close() that got shielded away from a caller's
         # cancellation (#67470 review, egilewski): asyncio requires holding
@@ -218,6 +233,14 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         # mid-close, silently dropping the very cleanup being protected.
         self._teardown_tasks: Set["asyncio.Task"] = set()
         self._msg_id: int = 0
+        # Monotonic timestamp bumped by _listen_loop/_read_events on every
+        # iteration or received event; the watchdog compares against this to
+        # detect a wedged listener (#67470).
+        self._last_progress: float = time.monotonic()
+        # Generation counter bumped on each _listen_loop respawn; prevents
+        # abandoned listener instances from interfering with new generations
+        # after watchdog-driven cancellation + reconnection (#68540 sweeper review).
+        self._listen_gen: int = 0
 
         # Configuration from extra
         extra = config.extra or {}
@@ -274,8 +297,11 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                     self.name,
                 )
 
-            # Start background listener
+            # Start background listener + its cause-agnostic watchdog (#67470)
+            self._last_progress = time.monotonic()
+            self._listen_gen += 1
             self._listen_task = asyncio.create_task(self._listen_loop())
+            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
             self._running = True
             logger.info("[%s] Connected to %s", self.name, self._hass_url)
             return True
@@ -366,6 +392,8 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             await self._cleanup_ws()
             return False
         except asyncio.CancelledError:
+            # Cancelled mid-handshake (disconnect / watchdog respawn): don't
+            # leave the half-authenticated connection dangling.
             await self._cleanup_ws()
             raise
         except Exception as e:
@@ -412,10 +440,12 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         on the caller while it's in flight.
 
         ``_bounded_close()`` alone isn't enough: if the coroutine calling it
-        is cancelled a second time while the close is still running,
-        that second cancellation interrupts the bounded close await
-        before ``close()`` finishes, leaking the resource exactly like
-        the original
+        is cancelled a second time while the close is still running (e.g.
+        the watchdog's wedged-listener respawn and disconnect() can both
+        cancel the same listen task -- adapter.py's ``_cancel_task_bounded``
+        call sites), that second cancellation interrupts
+        the bounded close await before ``close()``
+        finishes, leaking the resource exactly like the original
         unhandled-CancelledError bug it was meant to fix (#67470 review,
         egilewski -- verified empirically: a bare `except
         asyncio.CancelledError: await self._bounded_close(...); raise`
@@ -440,7 +470,7 @@ class HomeAssistantAdapter(BasePlatformAdapter):
 
         A truly wedged task can ignore cancellation (blocked in an
         uncancellable await); an unbounded ``await task`` there would hang
-        ``disconnect()`` — the very stall this fix removes.
+        the watchdog or ``disconnect()`` — the very stall this fix removes.
         On timeout the zombie is logged and abandoned: staying deaf is worse
         than leaking one stuck task (#67470).
         """
@@ -504,22 +534,26 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         self._running = False
         # The whole teardown sequence runs as one tracked, shielded unit
         # (#67470 review, egilewski, round 3): disconnect() has several
-        # sequential stages (cancel listener, close WS/session, close
-        # REST session), each separated by its own await. A cancellation
-        # landing at any earlier stage previously aborted the whole
-        # coroutine, leaving every later stage's resources untouched --
-        # e.g. cancelling during the WS/session close left the REST
-        # session assigned and never closed at all. Wrapping it all in
-        # one shielded task means disconnect() still propagates a
-        # cancellation to its caller promptly, but every stage still
-        # runs to completion in the background regardless of where that
-        # cancellation landed.
+        # sequential stages (cancel watchdog, cancel listener, close
+        # WS/session, close REST session), each separated by its own
+        # await. A cancellation landing at any earlier stage previously
+        # aborted the whole coroutine, leaving every later stage's
+        # resources untouched -- e.g. cancelling during the WS/session
+        # close left the REST session assigned and never closed at all.
+        # Wrapping it all in one shielded task means disconnect() still
+        # propagates a cancellation to its caller promptly, but every
+        # stage still runs to completion in the background regardless of
+        # where that cancellation landed.
         task = self._track_teardown(self._full_teardown())
         await asyncio.shield(task)
 
     async def _full_teardown(self) -> None:
-        """The complete disconnect() sequence; see the comment in
-        disconnect() for why this runs as a single shielded unit."""
+        """The complete disconnect() sequence; see disconnect()'s
+        docstring for why this runs as a single shielded unit."""
+        # Watchdog first so it can't respawn the listener mid-teardown; both
+        # awaits are bounded so a wedged task can't hang shutdown (#67470).
+        await self._cancel_task_bounded(self._watchdog_task, "watchdog task")
+        self._watchdog_task = None
         await self._cancel_task_bounded(self._listen_task, "listen task")
         self._listen_task = None
 
@@ -552,11 +586,26 @@ class HomeAssistantAdapter(BasePlatformAdapter):
 
     async def _listen_loop(self) -> None:
         """Main event loop with automatic reconnection."""
+        # Capture the generation at entry so this loop instance can detect
+        # if it's been abandoned by a watchdog-driven respawn and guard
+        # against interfering with the new generation's connection (#68540).
+        gen = self._listen_gen
         backoff_idx = 0
 
         while self._running:
+            # Stale-generation check: if watchdog respawned the listener,
+            # this abandoned instance must exit rather than manipulate the
+            # new generation's connection or state (#68540 sweeper review).
+            if gen != self._listen_gen:
+                return
+
+            # Progress heartbeat for the watchdog (#67470): each pass through
+            # the outer loop counts as forward motion even before any event
+            # arrives, so a connect that never yields a message still shows
+            # up as "alive" rather than immediately tripping the watchdog.
+            self._last_progress = time.monotonic()
             try:
-                await self._read_events()
+                await self._read_events(gen)
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -571,6 +620,11 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             await asyncio.sleep(delay)
             backoff_idx += 1
 
+            # Stale-generation check before reconnect path: prevent abandoned
+            # listener from reconnecting after it's been replaced (#68540).
+            if gen != self._listen_gen:
+                return
+
             try:
                 await self._cleanup_ws()
                 success = await self._ws_connect()
@@ -580,11 +634,114 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[%s] Reconnection failed: %s", self.name, e)
 
-    async def _read_events(self) -> None:
-        """Read events from WebSocket until disconnected."""
+    async def _watchdog_loop(self) -> None:
+        """Cause-agnostic watchdog over ``_listen_loop`` (#67470).
+
+        ``_listen_loop`` can wedge on an await with no local bound (e.g. a
+        hung aiohttp internals call) and never re-enter its own
+        except/reconnect branch. Nothing else observes that stall — the
+        process stays alive but the gateway goes silently deaf. Mirrors the
+        Telegram adapter's wedged-recovery watchdog: an independent task
+        periodically checks ``_last_progress`` and force-recovers when it
+        goes stale.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(_WATCHDOG_INTERVAL)
+            except asyncio.CancelledError:
+                return
+
+            if not self._running:
+                return
+
+            stalled_for = time.monotonic() - self._last_progress
+            if stalled_for <= _LISTEN_STUCK_TIMEOUT:
+                continue
+
+            # Quiet ≠ wedged: aiohttp answers heartbeat PINGs internally, so
+            # a healthy HA with no state changes produces no frames for
+            # _read_events and looks stalled by progress alone. Probe at the
+            # HA protocol layer: send a `ping`; the `pong` comes back as a
+            # normal frame, so the (healthy) reader bumps _last_progress and
+            # we skip the respawn. A wedged socket/reader can't answer.
+            if await self._listener_alive_after_ping():
+                continue
+
+            logger.error(
+                "[%s] Listen loop wedged for %.0fs with no progress "
+                "(HA ping probe unanswered); cancelling and respawning it",
+                self.name, stalled_for,
+            )
+
+            await self._respawn_listener()
+
+    async def _respawn_listener(self) -> None:
+        """Abandon the current listener (which may be cancellation-resistant
+        and survive the bounded cancel) and spawn a replacement generation.
+
+        Order matters: the old generation is revoked BEFORE awaiting cleanup,
+        because the abandoned task can resume inside that await — with its
+        generation still current it would sail through the loop guards into
+        the reconnect path of the replacement (#68540 sweeper review,
+        second pass)."""
+        await self._cancel_task_bounded(self._listen_task, "wedged listen task")
+
+        self._listen_gen += 1
+
+        await self._cleanup_ws()
+
+        if not self._running:
+            return
+
+        self._last_progress = time.monotonic()
+        self._listen_task = asyncio.create_task(self._listen_loop())
+
+    async def _listener_alive_after_ping(self) -> bool:
+        """Send an HA-protocol ping and report whether the reader saw a reply.
+
+        Keeps the single-reader invariant: this never reads the socket — the
+        pong arrives through ``_read_events``'s ``async for``, which bumps
+        ``_last_progress``. Returns True when progress advanced within
+        ``_PING_GRACE`` (listener demonstrably alive), False otherwise
+        (#67470 review follow-up).
+        """
+        ws = self._ws
+        if ws is None or ws.closed:
+            return False
+        probe_start = time.monotonic()
+        try:
+            await asyncio.wait_for(
+                ws.send_json({"id": self._next_id(), "type": "ping"}),
+                timeout=_DRAIN_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False  # can't even send — treat as wedged
+        try:
+            await asyncio.sleep(_PING_GRACE)
+        except asyncio.CancelledError:
+            raise
+        return self._last_progress >= probe_start
+
+    async def _read_events(self, gen: Optional[int] = None) -> None:
+        """Read events from WebSocket until disconnected.
+
+        ``gen`` is the listener generation this reader belongs to. A
+        cancellation-resistant iterator can yield again AFTER the watchdog
+        has replaced the listener; without the per-frame check that stale
+        frame would overwrite the replacement's ``_last_progress`` (masking
+        a wedged new reader from the watchdog) and could dispatch an event
+        through the old plumbing (#68540 sweeper review, second pass).
+        """
         if self._ws is None or self._ws.closed:
             return
         async for ws_msg in self._ws:
+            if gen is not None and gen != self._listen_gen:
+                return
+            # Any received frame is progress for the watchdog (#67470), not
+            # just ones that parse into a state_changed event.
+            self._last_progress = time.monotonic()
             if ws_msg.type == aiohttp.WSMsgType.TEXT:
                 try:
                     data = json.loads(ws_msg.data)
