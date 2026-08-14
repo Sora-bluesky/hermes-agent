@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
+from hermes_cli.config import get_custom_provider_pricing_conversion
 from utils import base_url_host_matches
 
 logger = logging.getLogger(__name__)
@@ -1257,14 +1258,74 @@ def get_pricing_entry(
     if route.provider == "openrouter":
         return _openrouter_pricing_entry(route)
     if route.base_url:
+        metadata = fetch_endpoint_model_metadata(
+            route.base_url,
+            api_key=api_key or "",
+        )
         entry = _pricing_entry_from_metadata(
-            fetch_endpoint_model_metadata(route.base_url, api_key=api_key or ""),
+            metadata,
             route.model,
             source_url=f"{route.base_url.rstrip('/')}/models",
             pricing_version="openai-compatible-models-api",
         )
         if entry:
-            return entry
+            model_metadata = metadata.get(route.model)
+            pricing_metadata = (
+                model_metadata.get("pricing")
+                if isinstance(model_metadata, dict)
+                else None
+            )
+            raw_currency = (
+                pricing_metadata.get("currency")
+                if isinstance(pricing_metadata, dict)
+                else None
+            )
+            declared_currency = (
+                raw_currency.strip().upper()
+                if isinstance(raw_currency, str) and raw_currency.strip()
+                else None
+            )
+
+            # An explicit USD declaration is authoritative.
+            if declared_currency == "USD":
+                return entry
+
+            conversion = get_custom_provider_pricing_conversion(route.base_url)
+            if declared_currency and (
+                conversion is None or conversion[0] != declared_currency
+            ):
+                # A non-USD declaration without a matching conversion must not
+                # surface as USD; fall through to the official docs table
+                # (always USD) instead of presenting the raw numbers.
+                entry = None
+
+            if entry is not None and conversion:
+                currency, usd_rate = conversion
+
+                def _to_usd(value: Optional[Decimal]) -> Optional[Decimal]:
+                    return value * usd_rate if value is not None else None
+
+                return replace(
+                    entry,
+                    input_cost_per_million=_to_usd(
+                        entry.input_cost_per_million
+                    ),
+                    output_cost_per_million=_to_usd(
+                        entry.output_cost_per_million
+                    ),
+                    cache_read_cost_per_million=_to_usd(
+                        entry.cache_read_cost_per_million
+                    ),
+                    cache_write_cost_per_million=_to_usd(
+                        entry.cache_write_cost_per_million
+                    ),
+                    request_cost=_to_usd(entry.request_cost),
+                    pricing_version=(
+                        f"{entry.pricing_version}+currency:{currency}"
+                    ),
+                )
+            if entry is not None:
+                return entry
     return _lookup_official_docs_pricing(route)
 
 

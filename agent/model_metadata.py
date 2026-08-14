@@ -1143,6 +1143,9 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
                     pricing[target] = normalized[alias]
                     break
         if pricing:
+            currency = normalized.get("currency")
+            if isinstance(currency, str) and currency.strip():
+                pricing["currency"] = currency
             return pricing
     return {}
 

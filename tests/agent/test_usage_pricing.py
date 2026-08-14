@@ -1,4 +1,9 @@
+from decimal import Decimal
 from types import SimpleNamespace
+
+import pytest
+
+import agent.usage_pricing as usage_pricing
 
 from agent.usage_pricing import (
     CanonicalUsage,
@@ -8,13 +13,180 @@ from agent.usage_pricing import (
     normalize_usage,
     resolve_billing_route,
 )
-from decimal import Decimal
 
 
 
 
 
 
+
+
+_CUSTOM_PRICING_BASE_URL = "https://router.example/v1"
+_CUSTOM_PRICING_MODEL = "router-model"
+
+
+def _patch_custom_endpoint_metadata(monkeypatch, pricing):
+    from agent.model_metadata import _extract_pricing
+
+    extracted = _extract_pricing({"pricing": pricing})
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda *_args, **_kwargs: {
+            _CUSTOM_PRICING_MODEL: {"pricing": extracted}
+        },
+    )
+
+
+def _patch_custom_pricing_config(monkeypatch, pricing=None):
+    config = {}
+    if pricing is not None:
+        config = {
+            "custom_providers": [
+                {
+                    "name": "router",
+                    # Exercise normalized route identity matching.
+                    "base_url": f"{_CUSTOM_PRICING_BASE_URL}/",
+                    "pricing": pricing,
+                }
+            ]
+        }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+
+
+def test_custom_provider_non_usd_pricing_uses_static_usd_conversion(
+    monkeypatch,
+):
+    """Regression guard for #85883: native per-token prices must become USD."""
+    _patch_custom_pricing_config(
+        monkeypatch,
+        {"currency": "RUB", "usd_rate": 0.011},
+    )
+    _patch_custom_endpoint_metadata(
+        monkeypatch,
+        {
+            "prompt": "8.137e-6",
+            "completion": "0.000012",
+            "cache_read": "0.000002",
+            "cache_write": "0.000003",
+            "request": "0.25",
+            "currency": "rub",
+        },
+    )
+
+    entry = get_pricing_entry(
+        _CUSTOM_PRICING_MODEL,
+        provider="custom",
+        base_url=_CUSTOM_PRICING_BASE_URL,
+    )
+
+    assert entry is not None
+    assert entry.input_cost_per_million == Decimal("0.089507")
+    assert entry.output_cost_per_million == Decimal("0.132")
+    assert entry.cache_read_cost_per_million == Decimal("0.022")
+    assert entry.cache_write_cost_per_million == Decimal("0.033")
+    assert entry.request_cost == Decimal("0.00275")
+    assert entry.source == "provider_models_api"
+    assert (
+        entry.pricing_version
+        == "openai-compatible-models-api+currency:RUB"
+    )
+
+
+def test_custom_endpoint_non_usd_pricing_without_conversion_is_unknown(
+    monkeypatch,
+):
+    _patch_custom_pricing_config(monkeypatch)
+    _patch_custom_endpoint_metadata(
+        monkeypatch,
+        {"prompt": "8.137e-6", "currency": "rUb"},
+    )
+
+    entry = get_pricing_entry(
+        _CUSTOM_PRICING_MODEL,
+        provider="custom",
+        base_url=_CUSTOM_PRICING_BASE_URL,
+    )
+
+    assert entry is None
+
+
+def test_custom_endpoint_usd_declaration_keeps_existing_pricing(
+    monkeypatch,
+):
+    # Endpoint-declared USD wins over a conflicting local conversion.
+    _patch_custom_pricing_config(
+        monkeypatch,
+        {"currency": "RUB", "usd_rate": "0.011"},
+    )
+    _patch_custom_endpoint_metadata(
+        monkeypatch,
+        {"prompt": "8.137e-6", "currency": "uSd"},
+    )
+
+    entry = get_pricing_entry(
+        _CUSTOM_PRICING_MODEL,
+        provider="custom",
+        base_url=_CUSTOM_PRICING_BASE_URL,
+    )
+
+    assert entry is not None
+    assert entry.input_cost_per_million == Decimal("8.137")
+    assert entry.request_cost is None
+    assert entry.pricing_version == "openai-compatible-models-api"
+
+
+def test_custom_endpoint_declared_currency_must_match_config(
+    monkeypatch,
+):
+    _patch_custom_pricing_config(
+        monkeypatch,
+        {"currency": "EUR", "usd_rate": "1.1"},
+    )
+    _patch_custom_endpoint_metadata(
+        monkeypatch,
+        {"prompt": "8.137e-6", "currency": "RUB"},
+    )
+
+    entry = get_pricing_entry(
+        _CUSTOM_PRICING_MODEL,
+        provider="custom",
+        base_url=_CUSTOM_PRICING_BASE_URL,
+    )
+
+    assert entry is None
+
+
+@pytest.mark.parametrize(
+    "invalid_rate",
+    [0, -1, "not-a-number", "NaN", "Infinity"],
+)
+@pytest.mark.parametrize("declared_currency", [None, "RUB"])
+def test_custom_provider_invalid_usd_rate_is_ignored(
+    monkeypatch,
+    invalid_rate,
+    declared_currency,
+):
+    _patch_custom_pricing_config(
+        monkeypatch,
+        {"currency": "RUB", "usd_rate": invalid_rate},
+    )
+    endpoint_pricing = {"prompt": "8.137e-6"}
+    if declared_currency is not None:
+        endpoint_pricing["currency"] = declared_currency
+    _patch_custom_endpoint_metadata(monkeypatch, endpoint_pricing)
+
+    entry = get_pricing_entry(
+        _CUSTOM_PRICING_MODEL,
+        provider="custom",
+        base_url=_CUSTOM_PRICING_BASE_URL,
+    )
+
+    if declared_currency is not None:
+        assert entry is None
+    else:
+        assert entry is not None
+        assert entry.input_cost_per_million == Decimal("8.137")
+        assert entry.pricing_version == "openai-compatible-models-api"
 
 
 def test_normalize_usage_reads_deepseek_native_cache_hit_tokens():
@@ -766,3 +938,31 @@ def test_normalize_usage_nested_details_win_over_qwen_flat_top_level():
 
     assert normalized.cache_read_tokens == 900
     assert normalized.input_tokens == 1100
+
+
+def test_declared_currency_with_matching_conversion_converts(monkeypatch):
+    metadata = {
+        "m": {
+            "pricing": {
+                "prompt": "0.000008137",
+                "completion": "0.000020133",
+                "currency": "RUB",
+            }
+        }
+    }
+    monkeypatch.setattr(
+        usage_pricing,
+        "fetch_endpoint_model_metadata",
+        lambda base_url, api_key="": metadata,
+    )
+    monkeypatch.setattr(
+        usage_pricing,
+        "get_custom_provider_pricing_conversion",
+        lambda base_url: ("RUB", Decimal("0.011")),
+    )
+    entry = usage_pricing.get_pricing_entry(
+        "m", provider="custom", base_url="https://rub.example/api/v1"
+    )
+    assert entry is not None
+    assert entry.input_cost_per_million == Decimal("0.000008137") * 1_000_000 * Decimal("0.011")
+    assert "+currency:RUB" in (entry.pricing_version or "")

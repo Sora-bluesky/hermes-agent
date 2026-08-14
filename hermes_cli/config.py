@@ -29,6 +29,7 @@ import threading
 import time
 import unicodedata
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
 
@@ -1328,6 +1329,7 @@ def _normalize_custom_provider_entry(
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers",
+        "pricing",
         "ssl_ca_cert", "ssl_verify",
     }
     for camel, snake in _CAMEL_ALIASES.items():
@@ -1456,6 +1458,10 @@ def _normalize_custom_provider_entry(
     if isinstance(extra_body, dict):
         normalized["extra_body"] = dict(extra_body)
 
+    pricing = entry.get("pricing")
+    if isinstance(pricing, dict):
+        normalized["pricing"] = dict(pricing)
+
     # Per-provider extra HTTP headers (proxies, gateways, custom auth).
     # Values may carry credentials (e.g. CF-Access-Client-Secret) — never
     # log them anywhere downstream.
@@ -1500,6 +1506,7 @@ def _custom_provider_entry_to_provider_config(
         "rate_limit_delay",
         "discover_models",
         "extra_body",
+        "pricing",
         "extra_headers",
         "ssl_ca_cert",
         "ssl_verify",
@@ -1833,6 +1840,72 @@ def get_custom_provider_model_capability(
     return None
 
 
+def get_custom_provider_pricing_conversion(
+    base_url: str,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[Tuple[str, Decimal]]:
+    """Return a custom provider's native currency and fixed USD conversion rate."""
+    if not base_url:
+        return None
+    if custom_providers is None:
+        try:
+            custom_providers = get_compatible_custom_providers(config)
+        except Exception:
+            if config is None:
+                return None
+            raw = config.get("custom_providers")
+            custom_providers = raw if isinstance(raw, list) else []
+    if not isinstance(custom_providers, list):
+        return None
+
+    target_url = normalize_route_base_url(base_url)
+    if not target_url:
+        return None
+
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        entry_url = normalize_route_base_url(entry.get("base_url"))
+        if not entry_url or entry_url != target_url:
+            continue
+
+        pricing = entry.get("pricing")
+        if not isinstance(pricing, dict) or not pricing:
+            continue
+
+        raw_currency = pricing.get("currency")
+        raw_rate = pricing.get("usd_rate")
+        try:
+            usd_rate = Decimal(str(raw_rate))
+        except (InvalidOperation, TypeError, ValueError):
+            usd_rate = None
+
+        if (
+            not isinstance(raw_currency, str)
+            or not raw_currency.strip()
+            or usd_rate is None
+            or not usd_rate.is_finite()
+            or usd_rate <= 0
+        ):
+            provider_label = str(
+                entry.get("provider_key") or entry.get("name") or "?"
+            )
+            _warn_once_per_provider(
+                provider_label,
+                "pricing:conversion",
+                "Custom provider '%s': pricing.currency must be non-empty and "
+                "pricing.usd_rate must be a positive finite number; "
+                "conversion ignored",
+                provider_label,
+            )
+            continue
+
+        return raw_currency.strip().upper(), usd_rate
+
+    return None
+
+
 def _coerce_config_version(value: Any) -> int:
     """Return a safe integer config version, treating invalid values as legacy."""
     if isinstance(value, bool):
@@ -1936,12 +2009,13 @@ _KNOWN_ROOT_KEYS = frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
 # Valid fields inside a custom_providers list entry
 _VALID_CUSTOM_PROVIDER_FIELDS = {
     "name", "base_url", "api_key", "api_mode", "model", "models",
-    "context_length", "rate_limit_delay", "extra_body",
+    "context_length", "rate_limit_delay", "extra_body", "pricing",
     "ssl_ca_cert", "ssl_verify",
     # key_env is read at runtime by runtime_provider.py and auxiliary_client.py
     # — include it here so the set accurately describes the supported schema.
     "key_env",
 }
+
 
 # Fields that look like they should be inside custom_providers, not at root
 _CUSTOM_PROVIDER_LIKE_FIELDS = {"base_url", "api_key", "rate_limit_delay", "api_mode"}
