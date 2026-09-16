@@ -187,14 +187,8 @@ pub async fn launch_hermes_desktop(
     // directly; this matches user double-click/open behavior and avoids cwd /
     // quarantine oddities after a self-update rebuild.
     let mut cmd = desktop_launch_command(&exe_path, &install_root);
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS = 0x00000008
-        cmd.creation_flags(0x0000_0008);
-    }
 
-    cmd.spawn().map_err(|e| {
+    spawn_detached_desktop(cmd.as_std_mut()).map_err(|e| {
         format!(
             "failed to launch {}: {e}",
             exe_path.display()
@@ -364,6 +358,51 @@ fn write_bootstrap_complete_marker(install_root: &Path, pin: &Pin) -> Result<ser
     Ok(marker)
 }
 
+#[cfg(windows)]
+fn detach_inheritable_std_handles() {
+    use windows_sys::Win32::Foundation::{
+        SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    for (kind, name) in [
+        (STD_INPUT_HANDLE, "STD_INPUT_HANDLE"),
+        (STD_OUTPUT_HANDLE, "STD_OUTPUT_HANDLE"),
+        (STD_ERROR_HANDLE, "STD_ERROR_HANDLE"),
+    ] {
+        // SAFETY: GetStdHandle has no preconditions; the second call receives its validated result.
+        let result = unsafe {
+            let h = GetStdHandle(kind);
+            if h.is_null() || h == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0)
+        };
+        if result == 0 {
+            tracing::warn!(std_handle = name, "could not detach inheritable standard handle");
+        }
+    }
+}
+
+fn spawn_detached_desktop(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        // The installer's stdout/stderr may be pipes the user's shell is reading.
+        // Windows duplicates every inheritable handle into the child regardless of
+        // its stdio (rust-lang/rust#54760), so clear the flags immediately before
+        // this handoff; the installer exits moments later.
+        // DETACHED_PROCESS = 0x00000008
+        cmd.creation_flags(0x0000_0008);
+        detach_inheritable_std_handles();
+    }
+
+    cmd.spawn()
+}
+
 /// Spawn the already-built desktop app, detached. Returns Err if no built app
 /// exists or the spawn fails, so the caller can fall back to showing the
 /// installer UI.
@@ -372,16 +411,7 @@ pub(crate) fn spawn_installed_desktop(install_root: &std::path::Path) -> std::io
         std::io::Error::new(std::io::ErrorKind::NotFound, "no built Hermes desktop app")
     })?;
     let mut cmd = desktop_launch_command_std(&exe, install_root);
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS = 0x00000008 — keep the desktop alive after the
-        // installer exits, mirroring launch_hermes_desktop. Kept correct here
-        // even though the only caller is macOS-gated today, so future reuse on
-        // Windows doesn't reintroduce the relaunch race.
-        cmd.creation_flags(0x0000_0008);
-    }
-    cmd.spawn().map(|_child| ())
+    spawn_detached_desktop(&mut cmd).map(|_child| ())
 }
 
 // The installer exits right after launch, so Desktop must not keep its
@@ -1242,8 +1272,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn stdio_helper_launch() {
-        use std::os::windows::process::CommandExt;
-
         let mode = match std::env::var(STDIO_HELPER_ENV) {
             Ok(mode) => mode,
             Err(_) => return,
@@ -1265,8 +1293,7 @@ mod tests {
                     .args(["--exact", STDIO_SLEEPER_TEST, "--nocapture"])
                     .env(STDIO_HELPER_ENV, &mode)
                     .env(STDIO_SLEEPER_ENV, "1");
-                command.creation_flags(0x0000_0008);
-                command.spawn()
+                spawn_detached_desktop(&mut command)
             }
             "tokio" => {
                 let mut command = desktop_launch_command(&exe_path, &install_root);
@@ -1274,9 +1301,7 @@ mod tests {
                     .args(["--exact", STDIO_SLEEPER_TEST, "--nocapture"])
                     .env(STDIO_HELPER_ENV, &mode)
                     .env(STDIO_SLEEPER_ENV, "1");
-                let command = command.as_std_mut();
-                command.creation_flags(0x0000_0008);
-                command.spawn()
+                spawn_detached_desktop(command.as_std_mut())
             }
             _ => panic!("unknown stdio helper builder: {builder}"),
         }
