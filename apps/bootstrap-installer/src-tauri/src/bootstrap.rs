@@ -13,6 +13,7 @@
 //!   5. On success → `complete`. On any stage failure → `failed`. On cancel → `failed`.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -383,11 +384,16 @@ pub(crate) fn spawn_installed_desktop(install_root: &std::path::Path) -> std::io
     cmd.spawn().map(|_child| ())
 }
 
+// The installer exits right after launch, so Desktop must not keep its
+// stdout/stderr pipe open (issue TBD).
 #[cfg(target_os = "macos")]
 pub(crate) fn open_macos_app_detached(app_bundle: &std::path::Path) -> std::io::Result<()> {
     let mut cmd = std::process::Command::new("/usr/bin/open");
     cmd.arg(app_bundle);
     cmd.current_dir(crate::paths::hermes_home());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     cmd.spawn().map(|_child| ())
 }
 
@@ -411,12 +417,18 @@ fn desktop_launch_command(
             let mut cmd = tokio::process::Command::new("/usr/bin/open");
             cmd.arg(app_bundle);
             cmd.current_dir(crate::paths::hermes_home());
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
             return cmd;
         }
     }
 
     let mut cmd = tokio::process::Command::new(exe_path);
     cmd.current_dir(exe_path.parent().unwrap_or(install_root));
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     cmd
 }
 
@@ -430,12 +442,18 @@ fn desktop_launch_command_std(
             let mut cmd = std::process::Command::new("/usr/bin/open");
             cmd.arg(app_bundle);
             cmd.current_dir(crate::paths::hermes_home());
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
             return cmd;
         }
     }
 
     let mut cmd = std::process::Command::new(exe_path);
     cmd.current_dir(exe_path.parent().unwrap_or(install_root));
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     cmd
 }
 
@@ -1001,8 +1019,20 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use std::path::Path;
+    #[cfg(windows)]
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+
+    #[cfg(windows)]
+    const STDIO_HELPER_ENV: &str = "HERMES_BOOTSTRAP_STDIO_HELPER";
+    #[cfg(windows)]
+    const STDIO_SLEEPER_ENV: &str = "HERMES_BOOTSTRAP_STDIO_SLEEPER";
+    #[cfg(windows)]
+    const STDIO_HELPER_TEST: &str = "bootstrap::tests::stdio_helper_launch";
+    #[cfg(windows)]
+    const STDIO_SLEEPER_TEST: &str = "bootstrap::tests::stdio_sleeper";
+    #[cfg(windows)]
+    const STDIO_SENTINEL: &str = "helper-launched";
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
@@ -1207,5 +1237,157 @@ mod tests {
         tx.send(()).await.unwrap();
 
         assert!(retry_backoff_cancelled(Some(&mut rx)).await);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stdio_helper_launch() {
+        use std::os::windows::process::CommandExt;
+
+        let mode = match std::env::var(STDIO_HELPER_ENV) {
+            Ok(mode) => mode,
+            Err(_) => return,
+        };
+        let (builder, stream) = mode
+            .split_once(':')
+            .expect("stdio helper mode must be <builder>:<stream>");
+        assert!(
+            matches!(stream, "stdout" | "stderr"),
+            "unknown stdio helper stream: {stream}"
+        );
+
+        let exe_path = std::env::current_exe().expect("resolve current test executable");
+        let install_root = unique_tmp_dir("stdio-helper");
+        let child = match builder {
+            "std" => {
+                let mut command = desktop_launch_command_std(&exe_path, &install_root);
+                command
+                    .args(["--exact", STDIO_SLEEPER_TEST, "--nocapture"])
+                    .env(STDIO_HELPER_ENV, &mode)
+                    .env(STDIO_SLEEPER_ENV, "1");
+                command.creation_flags(0x0000_0008);
+                command.spawn()
+            }
+            "tokio" => {
+                let mut command = desktop_launch_command(&exe_path, &install_root);
+                command
+                    .args(["--exact", STDIO_SLEEPER_TEST, "--nocapture"])
+                    .env(STDIO_HELPER_ENV, &mode)
+                    .env(STDIO_SLEEPER_ENV, "1");
+                let command = command.as_std_mut();
+                command.creation_flags(0x0000_0008);
+                command.spawn()
+            }
+            _ => panic!("unknown stdio helper builder: {builder}"),
+        }
+        .expect("spawn detached stdio sleeper");
+        drop(child);
+        let _ = std::fs::remove_dir_all(&install_root);
+
+        match stream {
+            "stdout" => {
+                println!("{STDIO_SENTINEL}");
+                std::io::stdout()
+                    .flush()
+                    .expect("flush stdio helper stdout");
+            }
+            "stderr" => {
+                eprintln!("{STDIO_SENTINEL}");
+                std::io::stderr()
+                    .flush()
+                    .expect("flush stdio helper stderr");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stdio_sleeper() {
+        if matches!(
+            std::env::var(STDIO_SLEEPER_ENV).as_deref(),
+            Ok("1")
+        ) {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_desktop_launch_pipe_closes(builder: &str, stream: &str) {
+        let mode = format!("{builder}:{stream}");
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("resolve test executable"));
+        command
+            .args(["--exact", STDIO_HELPER_TEST, "--nocapture"])
+            .env(STDIO_HELPER_ENV, mode)
+            .stdin(Stdio::null());
+
+        match stream {
+            "stdout" => {
+                command.stdout(Stdio::piped()).stderr(Stdio::null());
+            }
+            "stderr" => {
+                command.stdout(Stdio::null()).stderr(Stdio::piped());
+            }
+            _ => panic!("unknown captured stream: {stream}"),
+        }
+
+        let mut helper = command.spawn().expect("spawn stdio helper");
+        let started = std::time::Instant::now();
+        let mut output = String::new();
+        match stream {
+            "stdout" => helper
+                .stdout
+                .take()
+                .expect("stdio helper stdout pipe")
+                .read_to_string(&mut output)
+                .expect("read stdio helper stdout to EOF"),
+            "stderr" => helper
+                .stderr
+                .take()
+                .expect("stdio helper stderr pipe")
+                .read_to_string(&mut output)
+                .expect("read stdio helper stderr to EOF"),
+            _ => unreachable!(),
+        };
+        let eof_elapsed = started.elapsed();
+        let status = helper.wait().expect("wait for stdio helper");
+
+        assert!(
+            output.contains(STDIO_SENTINEL),
+            "stdio helper test did not run or emit its sentinel; output: {output:?}"
+        );
+        assert!(
+            status.success(),
+            "stdio helper exited unsuccessfully: {status}; output: {output:?}"
+        );
+        assert!(
+            eof_elapsed < std::time::Duration::from_secs(2),
+            "{stream} pipe stayed open for {eof_elapsed:?}; the detached Desktop inherited it"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn desktop_launch_stdout_pipe_closes_when_installer_exits_std() {
+        assert_desktop_launch_pipe_closes("std", "stdout");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn desktop_launch_stderr_pipe_closes_when_installer_exits_std() {
+        assert_desktop_launch_pipe_closes("std", "stderr");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn desktop_launch_stdout_pipe_closes_when_installer_exits_tokio() {
+        assert_desktop_launch_pipe_closes("tokio", "stdout");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn desktop_launch_stderr_pipe_closes_when_installer_exits_tokio() {
+        assert_desktop_launch_pipe_closes("tokio", "stderr");
     }
 }
