@@ -360,30 +360,8 @@ fn write_bootstrap_complete_marker(install_root: &Path, pin: &Pin) -> Result<ser
 
 #[cfg(windows)]
 fn detach_inheritable_std_handles() {
-    use windows_sys::Win32::Foundation::{
-        SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-    };
-    use windows_sys::Win32::System::Console::{
-        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    };
+    // RED measurement: inheritance flags intentionally left unchanged.
 
-    for (kind, name) in [
-        (STD_INPUT_HANDLE, "STD_INPUT_HANDLE"),
-        (STD_OUTPUT_HANDLE, "STD_OUTPUT_HANDLE"),
-        (STD_ERROR_HANDLE, "STD_ERROR_HANDLE"),
-    ] {
-        // SAFETY: GetStdHandle has no preconditions; the second call receives its validated result.
-        let result = unsafe {
-            let h = GetStdHandle(kind);
-            if h.is_null() || h == INVALID_HANDLE_VALUE {
-                continue;
-            }
-            SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0)
-        };
-        if result == 0 {
-            tracing::warn!(std_handle = name, "could not detach inheritable standard handle");
-        }
-    }
 }
 
 fn spawn_detached_desktop(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
@@ -421,9 +399,6 @@ pub(crate) fn open_macos_app_detached(app_bundle: &std::path::Path) -> std::io::
     let mut cmd = std::process::Command::new("/usr/bin/open");
     cmd.arg(app_bundle);
     cmd.current_dir(crate::paths::hermes_home());
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
     cmd.spawn().map(|_child| ())
 }
 
@@ -447,18 +422,12 @@ fn desktop_launch_command(
             let mut cmd = tokio::process::Command::new("/usr/bin/open");
             cmd.arg(app_bundle);
             cmd.current_dir(crate::paths::hermes_home());
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
             return cmd;
         }
     }
 
     let mut cmd = tokio::process::Command::new(exe_path);
     cmd.current_dir(exe_path.parent().unwrap_or(install_root));
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
     cmd
 }
 
@@ -472,18 +441,12 @@ fn desktop_launch_command_std(
             let mut cmd = std::process::Command::new("/usr/bin/open");
             cmd.arg(app_bundle);
             cmd.current_dir(crate::paths::hermes_home());
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
             return cmd;
         }
     }
 
     let mut cmd = std::process::Command::new(exe_path);
     cmd.current_dir(exe_path.parent().unwrap_or(install_root));
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
     cmd
 }
 
