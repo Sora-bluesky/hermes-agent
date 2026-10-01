@@ -213,7 +213,8 @@ class GatewayProfileReconcileMixin:
 
     async def _unserve_profile(self, name: str, home: "Path") -> None:
         """Stop and unroute one profile: cancel its reconnects, tear down its adapters, drop its
-        bookkeeping and release this process's handles into its home so the deleter's rmtree succeeds.
+        bookkeeping and release this process's state DBs, memory store, MCP transports and stderr
+        log handle, and routed log handlers so the deleter's rmtree succeeds.
 
         The whole teardown runs inside the removed profile's own runtime scope: adapter disconnect
         hooks, the agent-cache eviction (provider/memory shutdown) and the state/memory handle
@@ -256,6 +257,17 @@ class GatewayProfileReconcileMixin:
             with _log_suppressed(logging.DEBUG, "memory-store release failed", exc_info=True):
                 from plugins.memory.holographic.store import MemoryStore
                 MemoryStore.release_all_under(home)
+            # MCP waits on its loop and log release joins the QueueListener; keep both off the
+            # gateway loop. asyncio.to_thread copies this profile's ContextVars to its worker.
+            with _log_suppressed(logging.DEBUG, "MCP server release failed", exc_info=True):
+                from hermes_constants import hermes_home_key
+                from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+
+                await asyncio.to_thread(shutdown_mcp_servers, scope=hermes_home_key(home))
+            with _log_suppressed(logging.DEBUG, "profile log handler release failed", exc_info=True):
+                from hermes_logging import release_profile_log_handlers
+
+                await asyncio.to_thread(release_profile_log_handlers, home)
             logger.info("[MULTIPLEX] Profile '%s' unserved — %d adapter(s) stopped and unrouted", name, len(adapters))
 
 

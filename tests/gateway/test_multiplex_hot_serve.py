@@ -7,15 +7,18 @@ profiles' live adapters. The cron ticker's live enumerator is covered in ``tests
 """
 import asyncio
 import json
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import hermes_logging
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner
 from gateway.run_profile_reconcile import profile_serve_signature
 from gateway.status import flush_runtime_status
+from hermes_constants import hermes_home_key, mark_named_profile_deleted
 
 
 class _Adapter:
@@ -249,6 +252,72 @@ async def test_deleted_profile_is_torn_down_and_unrouted_others_untouched(tmp_pa
     assert _served_record(home) == ["default", "alpha"]
     assert runner._profile_adapters["alpha"][Platform.DISCORD] is alpha_adapter
     assert alpha_adapter.disconnected is False
+
+
+@pytest.mark.asyncio
+async def test_deleted_profile_releases_its_log_handlers_and_mcp_scope(tmp_path, monkeypatch):
+    runner, home = _runner(tmp_path, monkeypatch)
+    alpha_dir = _mkprofile(home, "alpha", "DISCORD_BOT_TOKEN=alpha-token\n")
+    gamma_dir = _mkprofile(home, "gamma", "DISCORD_BOT_TOKEN=gamma-token\n")
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        await runner._start_secondary_profile_adapters()
+        assert _served_record(home) == ["default", "alpha", "gamma"]
+
+        existing = hermes_logging._new_file_handler(
+            home / "logs" / "agent.log", level=logging.INFO, max_bytes=0,
+            backup_count=0, formatter=logging.Formatter("%(message)s"),
+        )
+        try:
+            router = hermes_logging._ProfileRoutingFileHandler(existing, [home, alpha_dir, gamma_dir])
+        finally:
+            existing.close()
+
+        # Give the release function a real router without changing any existing queue listener.
+        monkeypatch.setattr(hermes_logging, "_queued_file_handlers", [router])
+        monkeypatch.setattr(hermes_logging, "_queue_listener", None)
+        try:
+            alpha_home = alpha_dir.resolve()
+            gamma_home = gamma_dir.resolve()
+            alpha_handler = router._handler_for_home(alpha_home)
+            gamma_handler = router._handler_for_home(gamma_home)
+            assert router._profile_handlers[alpha_home] is alpha_handler
+            assert router._profile_handlers[gamma_home] is gamma_handler
+            # The concurrent handler closes ``stream`` after every write; what rmtree trips over
+            # on Windows is the lock file it keeps in ``stream_lock``. Route one record to each
+            # profile home so both lock files are genuinely held open.
+            for profile_dir in (alpha_dir, gamma_dir):
+                opened = logging.LogRecord("test.profile-release", logging.INFO, __file__, 0, "open", (), None)
+                opened.hermes_home = str(profile_dir)
+                router.handle(opened)
+            assert alpha_handler.stream_lock is not None and not alpha_handler.stream_lock.closed
+            assert gamma_handler.stream_lock is not None and not gamma_handler.stream_lock.closed
+
+            mcp_calls = []
+
+            def record_shutdown(**kwargs):
+                mcp_calls.append(kwargs)
+
+            monkeypatch.setattr("tools.mcp_tool_lifecycle.shutdown_mcp_servers", record_shutdown)
+            mark_named_profile_deleted(gamma_dir)
+            result = await runner.reconcile_served_profiles()
+
+            assert result["removed"] == ["gamma"]
+            assert _served_record(home) == ["default", "alpha"]
+            assert gamma_home not in router._profile_handlers
+            assert gamma_home not in router._profile_homes
+            assert gamma_handler.stream_lock is None or gamma_handler.stream_lock.closed
+            assert router._profile_handlers[alpha_home] is alpha_handler
+            assert alpha_handler.stream_lock is not None and not alpha_handler.stream_lock.closed
+
+            record = logging.LogRecord("test.profile-release", logging.INFO, __file__, 0, "after release", (), None)
+            record.hermes_home = str(gamma_dir)
+            assert router._home_for_record(record) == router._default_home
+            router.handle(record)
+            assert gamma_home not in router._profile_handlers
+            assert mcp_calls == [{"scope": hermes_home_key(gamma_dir)}]
+            assert all(call["scope"] != hermes_home_key(alpha_dir) for call in mcp_calls)
+        finally:
+            router.close()
 
 
 @pytest.mark.asyncio
