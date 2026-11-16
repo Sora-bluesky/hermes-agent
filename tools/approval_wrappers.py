@@ -1,4 +1,4 @@
-"""Command-position normalization for the hardline floor (detection-only rewrites).
+"""Command-position normalization for approval guards (detection-only rewrites).
 
 The ``_CMDPOS``-anchored hardline rules see a verb only where the shell would run it. Two bounded
 projections put a verb that IS run back on that anchor:
@@ -22,6 +22,7 @@ import re
 _WRAPPER_WORDS = frozenset({
     "sudo", "doas", "env", "exec", "nohup", "setsid", "time",
     "command", "builtin", "nice", "ionice", "stdbuf", "timeout", "xargs",
+    "watch", "flock", "systemd-run", "runuser",
 })
 
 _MULTI_CALL_WORDS = frozenset({"busybox", "toybox"})
@@ -31,6 +32,18 @@ _WRAPPER_STR_OPERAND = {
              "--user", "--group", "--host", "--prompt", "--chdir", "--auth-type", "--login-class",
              "--role", "--type", "--chroot", "--command-timeout", "--other-user"},
     "doas": {"-u", "-C"},
+    "watch": {"-n", "--interval"},
+    "flock": {"-c", "--command", "-w", "-E", "--wait", "--timeout", "--conflict-exit-code"},
+    "systemd-run": {"-p", "-u", "-E", "-H", "-M", "-C", "--property", "--unit", "--setenv",
+                    "--host", "--machine", "--slice", "--description", "--uid", "--gid",
+                    "--working-directory", "--root-directory", "--service-type", "--expand-environment",
+                    "--nice", "--output", "--on-active", "--on-boot", "--on-startup", "--on-unit-active",
+                    "--on-unit-inactive", "--on-calendar", "--path-property", "--socket-property",
+                    "--timer-property", "--job-mode", "--background", "--capsule", "--json"},
+    "runuser": {"-c", "--command", "--session-command", "-u", "-s", "-g", "-G", "-w", "--user", "--shell", "--group", "--supp-group",
+                "--whitelist-environment"},
+    "script": {"-c", "--command", "-I", "-O", "-B", "-T", "-m", "--log-in", "--log-out", "--log-io",
+               "--log-timing", "--output-limit", "--logging-format"},
     # -S / --split-string carry the command itself: carried_command_variants scans that payload.
     "env": {"-u", "-C", "-a", "-S",
             "--unset", "--chdir", "--argv0", "--split-string"},
@@ -53,6 +66,11 @@ _WRAPPER_NUM_OPERAND = {
 # Lookup / query modes name a program without running it (`command -v reboot`, `ionice -p 1`).
 _WRAPPER_QUERY_OPTIONS = {
     "command": {"-v", "-V"}, "ionice": {"-p", "--pid", "--pgid", "--uid"},
+    "watch": {"-h", "--help", "-v", "--version"},
+    "flock": {"-h", "--help", "-V", "--version"},
+    "systemd-run": {"-h", "--help", "--version"},
+    "runuser": {"-h", "--help", "-V", "--version"},
+    "script": {"-h", "--help", "-V", "--version"},
     # `sudo -k cmd` / `--reset-timestamp cmd` still run cmd; only these modes take no command.
     "sudo": {"-l", "--list", "-v", "--validate", "-K", "--remove-timestamp"},
 }
@@ -84,6 +102,8 @@ _MAX_CARRIER_DEPTH = 3
 def _short_bundle(base: str, word: str) -> tuple[str, str | None, str]:
     """getopt walk of a short-option bundle: (leading flags, first option owning a value, the rest of
     the word). The rest is that option's attached value (`xargs -IfooI` sets -I to `fooI`)."""
+    if not word.startswith("-") or word.startswith("--"):
+        return "", None, ""
     valued = _WRAPPER_STR_OPERAND.get(base, set()) | _WRAPPER_NUM_OPERAND.get(base, set())
     for index, char in enumerate(word[1:], start=2):
         if "-" + char in valued:
@@ -183,42 +203,67 @@ def _wrapper_prefix_end(command: str, start: int) -> int:
             return ws if seen_prefix else start
         wrapper_start = ws if seen_prefix else start
         seen_prefix, pos = True, we
-        while True:  # this wrapper's options / assignments / leading positional
-            pos = _skip_redirects(command, pos)
-            ows, owe, oword = _read_shell_word(command, pos)
-            oword = _long_option(base, oword)
-            if ows == owe or oword == "--":
-                pos = _timeout_duration_end(command, owe) if base == "timeout" else owe
-                break
-            if oword.startswith("-") and oword != "-":
-                if _is_query_option(base, oword):
-                    return start
-                if _is_env_split_option(base, oword):
-                    # The split string is the program AND its leading args (`env -S 'echo' reboot`
-                    # prints): keep env as the program; carried_command_variants scans the payload.
-                    return wrapper_start
-                if "=" in oword:
-                    pos = owe  # --opt=value carries its own operand
-                    continue
-                kind = _option_kind(base, oword)  # case-sensitive: `sudo -H` vs `sudo -h host`
-                if kind is None:
-                    pos = owe  # no-operand flag
-                    continue
-                vws, vwe, value = _read_shell_word(command, owe)
-                if vws == vwe:
-                    pos = owe
-                    continue
-                if kind == "num" and not _WRAPPER_NUMBER_RE.fullmatch(value):
-                    return start  # invalid operand: the wrapper errors here
-                pos = vwe
+        pos, stop = _wrapper_options_end(command, base, pos, start, wrapper_start)
+        if stop:
+            return pos
+
+
+def _wrapper_options_end(command: str, base: str, pos: int, start: int, wrapper_start: int) -> tuple[int, bool]:
+    """Skip one wrapper's operands; the bool stops peeling at a carrier or query mode."""
+    from tools.approval_detection import _ENV_ASSIGNMENT_RE, _read_shell_word
+
+    lock_operand, runuser_direct = base == "flock", False
+    while True:  # this wrapper's options / assignments / leading positional
+        pos = _skip_redirects(command, pos)
+        ows, owe, oword = _read_shell_word(command, pos)
+        oword = _long_option(base, oword)
+        if ows == owe or oword == "--":
+            pos = _timeout_duration_end(command, owe) if base == "timeout" else owe
+            break
+        if oword.startswith("-") and oword != "-":
+            if _is_query_option(base, oword):
+                return start, True
+            if base in ("flock", "runuser") and (
+                    oword.split("=", 1)[0] in _SU_COMMAND_LONG
+                    or _short_bundle(base, oword)[1] == "-c"):
+                return wrapper_start, True  # -c carries shell text, not an argv command
+            if base == "runuser" and (oword.split("=", 1)[0] == "--user"
+                                       or _short_bundle(base, oword)[1] == "-u"):
+                runuser_direct = True
+            if _is_env_split_option(base, oword):
+                # The split string is the program AND its leading args (`env -S 'echo' reboot`
+                # prints): keep env as the program; carried_command_variants scans the payload.
+                return wrapper_start, True
+            if "=" in oword:
+                pos = owe  # --opt=value carries its own operand
                 continue
-            if base == "env" and _ENV_ASSIGNMENT_RE.fullmatch(oword):
+            kind = _option_kind(base, oword)  # case-sensitive: `sudo -H` vs `sudo -h host`
+            if kind is None:
+                pos = owe  # no-operand flag
+                continue
+            vws, vwe, value = _read_shell_word(command, _skip_redirects(command, owe))
+            if vws == vwe:
                 pos = owe
                 continue
-            if base == "timeout" and _WRAPPER_DURATION_RE.fullmatch(oword):
-                pos = owe  # leading duration positional
-                continue
-            break
+            if kind == "num" and not _WRAPPER_NUMBER_RE.fullmatch(value):
+                return start, True  # invalid operand: the wrapper errors here
+            pos = vwe
+            continue
+        if base == "env" and _ENV_ASSIGNMENT_RE.fullmatch(oword):
+            pos = owe
+            continue
+        if base == "timeout" and _WRAPPER_DURATION_RE.fullmatch(oword):
+            pos = owe  # leading duration positional
+            continue
+        if lock_operand:
+            lock_operand, pos = False, owe
+            continue
+        break
+    if base == "runuser" and not runuser_direct:
+        return wrapper_start, True  # without -u, the positional is a login user, not a program
+    if base == "flock" and lock_operand:
+        _, pos, _ = _read_shell_word(command, pos)  # flock -- LOCK COMMAND
+    return pos, False
 
 
 def strip_wrapper_prefixes(command: str) -> str:
@@ -239,38 +284,68 @@ def strip_wrapper_prefixes(command: str) -> str:
     return _splice(command, edits)
 
 
-def _su_command_payload(args: list[str]) -> str | None:
-    """The ``-c`` / ``--command`` string of a ``su`` / ``runuser`` argv (getopt permutes, so it may
-    follow the user name), or None."""
+def _su_command_payload(args: list[str], name: str = "su") -> str | None:
+    """The literal command option of su, runuser, script or flock, or None.
+    Options may follow a positional user or lock file; option operands are never commands."""
+    valued = _WRAPPER_STR_OPERAND.get(name, ())
+    value_short = _SU_VALUE_SHORT if name in ("su", "runuser") else {o[1:] for o in valued if len(o) == 2}
+    value_long = _SU_VALUE_LONG if name in ("su", "runuser") else {o for o in valued if o.startswith("--")}
+    positionals = 1 if name == "flock" else None
     index = 0
     while index < len(args):
         token = args[index]
         index += 1
-        if token == "--":
+        if token == "--" or _is_query_option(name, token):
             return None
         option, equals, value = token.partition("=")
         if option in _SU_COMMAND_LONG:
             return value if equals else (args[index] if index < len(args) else None)
-        if option in _SU_VALUE_LONG:
+        if option in value_long:
+            if name == "runuser" and option == "--user":
+                positionals = 0
             index += 0 if equals else 1
             continue
+        if token.startswith("--"):
+            continue
         if not re.fullmatch(r"-[a-zA-Z].*", token):
+            if positionals == 0:
+                return None  # argv command starts here: its -c arguments belong to the child
+            if positionals is not None:
+                positionals -= 1
             continue
         for offset, char in enumerate(token[1:], start=2):
             if char == "c":
                 return token[offset:] or (args[index] if index < len(args) else None)
-            if char in _SU_VALUE_SHORT:
+            if char in value_short:
+                if name == "runuser" and char == "u":
+                    positionals = 0
                 index += 0 if token[offset:] else 1
                 break
     return None
 
 
+def _carrier_tokens(command: str) -> list[str] | None:
+    """Tokenize argv after removing shell redirections, preserving quoted operator words."""
+    from tools.approval_detection import _read_shell_word, _shell_segment_tokens, _splice
+
+    edits, pos = [], 0
+    while pos < len(command):
+        after = _skip_redirects(command, pos)
+        if after != pos:
+            edits.append((pos, after, " "))
+            pos = after
+        start, end, _ = _read_shell_word(command, pos)
+        if start == end:
+            break
+        pos = end
+    return _shell_segment_tokens(_splice(command, edits), 0)
+
+
 def _carried_payloads(command: str):
-    """Literal command strings that env -S, su -c, runuser -c or a shell -c would run."""
+    """Literal commands carried by env -S or the command option of a shell, su, runuser, script or flock."""
     from tools.approval_detection import (
         _deobfuscate_shell_word_for_detection, _env_split_payload, _execution_flag_findings,
         _iter_shell_command_word_spans, _iter_top_level_shell_segments, _shell_command_segment,
-        _shell_segment_tokens,
     )
 
     for _, payload in _execution_flag_findings(command):
@@ -279,21 +354,22 @@ def _carried_payloads(command: str):
     for segment in _iter_top_level_shell_segments(command):
         for start, _, word in _iter_shell_command_word_spans(segment):
             name = re.split(r"[\\/]", _deobfuscate_shell_word_for_detection(word))[-1].lower()
-            if name not in ("env", "su", "runuser"):
+            if name not in ("env", "su", "runuser", "script", "flock"):
                 continue
             # Bound the carrier at its own command's end: in `echo "$(su -c 'x')"` the `)"` closing
             # the substitution is not su's argv and would leave the tokenizer an unmatched quote.
-            tokens = _shell_segment_tokens(_shell_command_segment(segment, start), 0)
+            tokens = _carrier_tokens(_shell_command_segment(segment, start))
             if not tokens:
                 continue
-            payload = _env_split_payload(tokens) if name == "env" else _su_command_payload(tokens[1:])
+            payload = _env_split_payload(tokens) if name == "env" else _su_command_payload(tokens[1:], name)
             if payload:
                 yield payload
 
 
-def carried_command_variants(command: str, capped: list[str] | None = None):
+def carried_command_variants(command: str, capped: list[str] | None = None, *, raw: bool = False):
     """Detection variants for literal carried command strings, recursing a bounded depth; each is
-    wrapper-peeled and command-start marked like the top-level command."""
+    wrapper-peeled and command-start marked like the top-level command. ``raw`` keeps
+    the original quote state for consumers that must parse executable positions themselves."""
     from tools.approval_detection import _command_detection_variants
 
     seen, frontier = {command}, [command]
@@ -304,17 +380,32 @@ def carried_command_variants(command: str, capped: list[str] | None = None):
                 if payload in seen:
                     continue
                 seen.add(payload)
-                yield from _command_detection_variants(payload, capped=capped, floors=True)
+                yield from (payload,) if raw else _command_detection_variants(payload, capped=capped, floors=True)
                 # A literal heredoc body inside the payload is text here too, as at the top level.
                 payload = _blank_literal_heredoc_bodies(payload)
                 nested.append(payload)
                 peeled = strip_wrapper_prefixes(payload)
-                yield from _command_detection_variants(peeled, capped=capped, floors=True)
+                yield from (peeled,) if raw else _command_detection_variants(peeled, capped=capped, floors=True)
                 # The peeled form can expose a carrier the raw walk stops before (`xargs su -c ...`).
                 if peeled not in seen:
                     seen.add(peeled)
                     nested.append(peeled)
         frontier = nested
+    if capped is not None:
+        for source in frontier:
+            if next((payload for payload in _carried_payloads(source) if payload not in seen), None):
+                capped.append(source)  # A literal command beyond the depth limit was not inspected.
+
+
+def wrapper_command_sources(command: str, capped: list[str] | None = None):
+    """Quote-faithful executable projections; never reparse detection-normalized argument data."""
+    command = _blank_literal_heredoc_bodies(command)
+    stripped = strip_wrapper_prefixes(command)
+    sources = carried_command_variants(command, capped=capped, raw=True)
+    if stripped != command:
+        yield stripped
+        sources = itertools.chain(sources, carried_command_variants(stripped, capped=capped, raw=True))
+    yield from dict.fromkeys(sources)
 
 
 def hardline_detection_variants(command: str, capped: list[str] | None = None):

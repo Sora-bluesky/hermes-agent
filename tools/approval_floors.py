@@ -240,10 +240,20 @@ def _matching_permanent_allowlist_entry(command: str) -> str | None:
         return None
     with _a._lock:
         patterns = tuple(_a._permanent_set())
+    patterns = tuple(pattern.strip() for pattern in patterns if isinstance(pattern, str) and pattern.strip())
+    if command in patterns:
+        return command
     for pattern in patterns:
-        pattern = pattern.strip() if isinstance(pattern, str) else ""
-        if pattern and (command == pattern or (any(ch in pattern for ch in "*?[")
-                                               and fnmatch.fnmatchcase(command, pattern))):
+        if any(ch in pattern for ch in "*?[") and fnmatch.fnmatchcase(command, pattern):
+            from tools.approval_detection import detect_dangerous_command
+            from tools.approval_wrappers import wrapper_command_sources
+
+            # A wrapper glob must not hide dangerous work. Projections can only withdraw a
+            # raw-command match; exact grants and ordinary unwrapped globs retain their meaning.
+            capped: list[str] = []
+            if any(detect_dangerous_command(source)[0]
+                   for source in wrapper_command_sources(command, capped=capped)) or capped:
+                return None
             return pattern
     return None
 

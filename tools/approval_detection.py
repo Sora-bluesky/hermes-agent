@@ -1143,7 +1143,16 @@ def _shell_segment_tokens(segment: str, start: int) -> list[str] | None:
 def _iter_top_level_shell_segments(command: str):
     """Yield top-level command segments in one left-to-right pass."""
     start = 0
+    last_redirect_end = -1
     for kind, i, j, quote in _scan_shell(command, comments=True):
+        if kind == "char" and quote is None:
+            char = command[i]
+            if char in "<>":
+                last_redirect_end = j
+            elif char in "&|" and (last_redirect_end == i or (char == "&" and command.startswith(">", j))):
+                # `>&`, `<&`, `>|` and `&>` are redirection operators, not separators.
+                if char == "&" or command[i - 1] == ">":
+                    continue
         if kind == "comment" or (kind == "char" and quote is None and command[i] in ";&|\n"):
             if start < i:
                 yield command[start:i]
@@ -1553,11 +1562,15 @@ def _deny_command_variants(command: str):
     the original quote state, preserve path-specific rules, and fold only the
     executable basename (never arbitrary argument paths).
     """
+    from tools.approval_wrappers import wrapper_command_sources
+
     yield from _command_detection_variants(command, floors=True)
     # Heredoc bodies are masked first, then ANSI-C expanded: `$'...'` inside a body is literal data.
     pending = list(dict.fromkeys(
-        expand_ansi_c_quotes(source) for source in heredoc_scan_sources(command, _SHELL_NAMES_RE, floors=True)))
-    seen = set()
+        variant for source in heredoc_scan_sources(command, _SHELL_NAMES_RE, floors=True)
+        for expanded in (expand_ansi_c_quotes(source),)
+        for variant in (expanded, *wrapper_command_sources(expanded))))
+    seen, candidates = set(), set()
     while pending:
         source = pending.pop()
         if source in seen:
@@ -1584,6 +1597,9 @@ def _deny_command_variants(command: str):
             tail = "".join(parts)
             for name in dict.fromkeys((executable, os.path.basename(executable))):
                 candidate = name + tail
+                if candidate in candidates:
+                    continue
+                candidates.add(candidate)
                 yield candidate
                 yield name + "".join(bare)
                 # Apply the existing text matching semantics only AFTER locating
