@@ -63,9 +63,10 @@ _SUDO_LONG_FLAGS = frozenset({
     "--reset-timestamp", "--non-interactive", "--preserve-groups", "--stdin", "--shell", "--version",
 })
 
-# A redirection before (or between) the words of a simple command (`2>/dev/null reboot`); not a heredoc or a
-# process substitution. Its target word follows.
-_LEADING_REDIRECT_RE = re.compile(r"[^\S\n]*+(?:\d+|&)?(?:>>|>&|>\||<>|<&|<<<|>|<)(?![<(])")
+# A redirection before (or between) the words of a simple command; its target word follows.
+_LEADING_REDIRECT_RE = re.compile(r"[^\S\n]*+(?:\d+|&)?(?:<<<|<<-?|>>|>&|>\||<>|<&|>|<)(?![<(])")
+_QUOTED_WINDOWS_EXECUTABLE_RE = re.compile(
+    r'''"[A-Za-z]:[\\/][^"$`\n]*[\\/]([^"'\\/\s]+)"(?:""|'')*(?=$|[\s;&|<>()`])''')
 
 # GNU timeout durations: optional `+`, decimal/exponent, hex integer, inf/infinity, one s/m/h/d
 # suffix (`-` is rejected); the numeric options (nice -n, ionice -n, sudo -C) take a plain integer.
@@ -227,14 +228,19 @@ def strip_wrapper_prefixes(command: str) -> str:
 
     # Starts are not discovered in offset order (`if` bodies come after later commands), so sort
     # and drop overlaps before splicing against the original offsets.
-    cuts = sorted(
-        (start, end) for start in _iter_shell_command_starts(command)
-        if (end := _wrapper_prefix_end(command, start)) > start
-    )
+    cuts = []
+    for start in _iter_shell_command_starts(command):
+        end = _wrapper_prefix_end(command, start)
+        # Locate the executable on raw quote state, before Windows slash normalization.
+        # A quoted directory can contain spaces that the flat command-path pattern cannot read.
+        if executable := _QUOTED_WINDOWS_EXECUTABLE_RE.match(command, end):
+            cuts.append((start, executable.end(), executable[1]))
+        elif end > start:
+            cuts.append((start, end, " "))
     edits, last_end = [], -1
-    for start, end in cuts:
+    for start, end, replacement in sorted(cuts):
         if start >= last_end:
-            edits.append((start, end, " "))
+            edits.append((start, end, replacement))
             last_end = end
     return _splice(command, edits)
 
